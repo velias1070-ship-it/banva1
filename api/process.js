@@ -16,6 +16,12 @@ module.exports = async function handler(req, res) {
   }
 
   try {
+    // 🔥 Forzamos Opus 4.5 aquí
+    const body = {
+      ...req.body,
+      model: "claude-opus-4-5-latest"
+    };
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -23,12 +29,13 @@ module.exports = async function handler(req, res) {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(body)
     });
 
     const responseText = await response.text();
     res.setHeader('Content-Type', 'application/json');
     return res.status(response.status).send(responseText);
+
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
