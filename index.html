@@ -145,8 +145,8 @@ function generateLabelsPDF(products, folioFactura) {
     
     // Sort products by category then name
     const sorted = [...products].sort((a, b) => {
-      const catA = extractCategory(a.nombre || a.nombreDict || "");
-      const catB = extractCategory(b.nombre || b.nombreDict || "");
+      const catA = extractCategory(a.nombreDict || a.nombre || "");
+      const catB = extractCategory(b.nombreDict || b.nombre || "");
       if (catA !== catB) return catA.localeCompare(catB);
       return (a.nombre || "").localeCompare(b.nombre || "");
     });
@@ -157,7 +157,7 @@ function generateLabelsPDF(products, folioFactura) {
     for (const product of sorted) {
       if (!product.codigoML || product.cantidad <= 0) continue;
       
-      const nombre = product.nombre || product.nombreDict || "";
+      const nombre = product.nombreDict || product.nombre || "";
       const category = extractCategory(nombre);
       
       // ---- CATEGORY SEPARATOR ----
@@ -705,15 +705,15 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     
     // Sort by category like the labels
     const sorted = [...validProducts].sort((a, b) => {
-      const catA = extractCategory(a.nombre || a.nombreDict || "");
-      const catB = extractCategory(b.nombre || b.nombreDict || "");
+      const catA = extractCategory(a.nombreDict || a.nombre || "");
+      const catB = extractCategory(b.nombreDict || b.nombre || "");
       if (catA !== catB) return catA.localeCompare(catB);
       return (a.nombre || "").localeCompare(b.nombre || "");
     });
     
     const totalUnits = sorted.reduce((s, p) => s + p.cantidad, 0);
     const totalProducts = sorted.length;
-    const categories = [...new Set(sorted.map(p => extractCategory(p.nombre || p.nombreDict || "")))];
+    const categories = [...new Set(sorted.map(p => extractCategory(p.nombreDict || p.nombre || "")))];
     const fecha = new Date().toLocaleDateString("es-CL", { day: "2-digit", month: "2-digit", year: "numeric" });
     const hora = new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" });
     
@@ -727,7 +727,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     let catUnits = 0;
     
     sorted.forEach((p, idx) => {
-      const cat = extractCategory(p.nombre || p.nombreDict || "");
+      const cat = extractCategory(p.nombreDict || p.nombre || "");
       
       if (cat !== currentCat) {
         // Category subtotal for previous category
@@ -753,7 +753,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
       tableRows += `<tr style="background:${idx % 2 === 0 ? '#fff' : '#fafafa'};">
         <td style="padding:6px 10px;border:1px solid #eee;font-family:monospace;font-weight:600;">${p.sku || ""}</td>
         <td style="padding:6px 10px;border:1px solid #eee;font-family:monospace;font-weight:600;color:#2563EB;">${p.codigoML}</td>
-        <td style="padding:6px 10px;border:1px solid #eee;font-size:12px;">${p.nombre || p.nombreDict || ""}</td>
+        <td style="padding:6px 10px;border:1px solid #eee;font-size:12px;">${p.nombreDict || p.nombre || ""}</td>
         <td style="padding:6px 10px;border:1px solid #eee;text-align:center;">${cat}</td>
         <td style="padding:6px 10px;border:1px solid #eee;text-align:center;font-weight:bold;">${p.cantidad}</td>
       </tr>`;
