@@ -3,7 +3,7 @@
 App web que convierte fotos de facturas en etiquetas con código de barras listas para imprimir.
 
 ## Cómo subir a Vercel (5 minutos)
-
+ 
 ### Paso 1: Crear cuenta en Vercel
 1. Ve a **https://vercel.com**
 2. Haz clic en **Sign Up**
