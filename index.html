@@ -417,7 +417,9 @@ function App() {
     setSheetLoading(true);
     setSheetStatus("");
     try {
-      const res = await fetch(url);
+      // Add cache-busting parameter to bypass Google's CSV cache
+      const cacheBuster = url.includes("?") ? `&_t=${Date.now()}` : `?_t=${Date.now()}`;
+      const res = await fetch(url + cacheBuster, { cache: "no-store" });
       if (!res.ok) throw new Error("No se pudo acceder al Sheet");
       const text = await res.text();
       const dict = parseCSV(text);
