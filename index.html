@@ -353,6 +353,8 @@ function App() {
   const [sheetLoading, setSheetLoading] = useState(false);
   const [sheetStatus, setSheetStatus] = useState(""); // "ok", "error", ""
   const [lastSync, setLastSync] = useState("");
+  const [showCatSeparators, setShowCatSeparators] = useState(true);
+  const [showProdSeparators, setShowProdSeparators] = useState(true);
   
   // Parse CSV text into dictionary array
   // Format: Col A=SKU Venta, B=Código ML, C=Nombre, D=?, E=SKU Proveedor, F=Cant Pack
@@ -681,11 +683,14 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
       return;
     }
     
-    const pages = await generateLabelsPDF(validProducts, folioFactura);
+    let pages = await generateLabelsPDF(validProducts, folioFactura);
+    // Filter separators based on toggles
+    if (!showCatSeparators) pages = pages.filter(p => p.type !== "separator-category");
+    if (!showProdSeparators) pages = pages.filter(p => p.type !== "separator-product");
     setLabelPages(pages);
     setStep("labels");
     setProcessing(false);
-  }, [extractedProducts, folioFactura]);
+  }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators]);
 
   // ---- Download Labels PDF ----
   const downloadLabelsPDF = useCallback(async () => {
@@ -993,10 +998,14 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     setFolioFactura("RAPIDO");
     
     const pages = await generateLabelsPDF(products, "RAPIDO");
-    setLabelPages(pages);
+    const filtered = pages.filter(p => 
+      (p.type !== "separator-category" || showCatSeparators) && 
+      (p.type !== "separator-product" || showProdSeparators)
+    );
+    setLabelPages(filtered);
     setStep("labels");
     setProcessing(false);
-  }, [quickItems]);
+  }, [quickItems, showCatSeparators, showProdSeparators]);
 
   // ---- Step indicator progress ----
   const stepIndex = STEPS.indexOf(step);
@@ -1198,6 +1207,18 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                     >
                       🏷️ Generar {quickItems.reduce((s, i) => s + i.cantidad, 0)} Etiqueta{quickItems.reduce((s, i) => s + i.cantidad, 0) !== 1 ? "s" : ""}
                     </button>
+
+                    {/* Separator toggles for quick mode */}
+                    <div style={{display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap"}}>
+                      <label style={{display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "#888"}}>
+                        <input type="checkbox" checked={showCatSeparators} onChange={(e) => setShowCatSeparators(e.target.checked)} style={{accentColor: "#3B82F6", width: 14, height: 14}} />
+                        Sep. categoría
+                      </label>
+                      <label style={{display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "#888"}}>
+                        <input type="checkbox" checked={showProdSeparators} onChange={(e) => setShowProdSeparators(e.target.checked)} style={{accentColor: "#3B82F6", width: 14, height: 14}} />
+                        Sep. producto
+                      </label>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1341,7 +1362,19 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
 
             <button style={styles.addBtn} onClick={addProduct}>+ Agregar producto</button>
 
-            <div style={{display: "flex", gap: 10, marginTop: 16}}>
+            {/* Separator toggles */}
+            <div style={{display: "flex", gap: 16, marginTop: 16, padding: "12px 14px", background: "#141416", borderRadius: 10, border: "1px solid #2A2A30"}}>
+              <label style={{display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "#CCC"}}>
+                <input type="checkbox" checked={showCatSeparators} onChange={(e) => setShowCatSeparators(e.target.checked)} style={{accentColor: "#3B82F6", width: 16, height: 16}} />
+                Separadores de categoría
+              </label>
+              <label style={{display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "#CCC"}}>
+                <input type="checkbox" checked={showProdSeparators} onChange={(e) => setShowProdSeparators(e.target.checked)} style={{accentColor: "#3B82F6", width: 16, height: 16}} />
+                Separadores de producto
+              </label>
+            </div>
+
+            <div style={{display: "flex", gap: 10, marginTop: 10}}>
               <button style={styles.secondaryBtn} onClick={() => setStep("upload")}>← Volver</button>
               <button 
                 style={{...styles.primaryBtn, flex: 1}}
