@@ -336,6 +336,9 @@ function App() {
   const [dictText, setDictText] = useState("");
   const [showDictModal, setShowDictModal] = useState(false);
   const [unmatchedProducts, setUnmatchedProducts] = useState([]);
+  const [quickSearch, setQuickSearch] = useState("");
+  const [quickItems, setQuickItems] = useState([]);
+  const quickSearchRef = useRef(null);
   
   // Load dictionary from localStorage on mount
   useEffect(() => {
@@ -542,78 +545,17 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
       setFolioFactura(parsed.folio || "");
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
-      // --- Fuzzy matching helpers ---
-      // Normalize: fix common OCR confusions
-      const normalize = (s) => (s || "").toUpperCase()
-        .replace(/[OÓ]/g, "0")  // O → 0
-        .replace(/[IÍ|]/g, "1") // I → 1
-        .replace(/[LÍ]/g, "1")  // L → 1 (in numeric context)
-        .replace(/[SŚ]/g, "5")  // S → 5 (in numeric context)
-        .replace(/[ZŹ]/g, "2")  // Z → 2
-        .replace(/[BŹ]/g, "8")  // B → 8 (in numeric context)
-        .replace(/\s+/g, "");
-      
-      // Levenshtein distance
-      const levenshtein = (a, b) => {
-        const m = a.length, n = b.length;
-        const dp = Array.from({length: m + 1}, (_, i) => 
-          Array.from({length: n + 1}, (_, j) => i === 0 ? j : j === 0 ? i : 0)
-        );
-        for (let i = 1; i <= m; i++)
-          for (let j = 1; j <= n; j++)
-            dp[i][j] = a[i-1] === b[j-1] 
-              ? dp[i-1][j-1] 
-              : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
-        return dp[m][n];
-      };
-      
-      // Find best match: exact → normalized → fuzzy (max 2 edits)
-      const findBestMatch = (sku) => {
-        const skuUp = (sku || "").toUpperCase().trim();
-        const skuNorm = normalize(sku);
-        
-        // 1. Exact match
-        let match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
-        if (match) return { ...match, matchType: "exacto" };
-        
-        // 2. Normalized match (O↔0, I↔1, etc.)
-        match = dictionary.find(d => normalize(d.sku) === skuNorm);
-        if (match) return { ...match, matchType: "normalizado" };
-        
-        // 3. Fuzzy match (Levenshtein ≤ 2)
-        let bestDist = 999, bestMatch = null;
-        for (const d of dictionary) {
-          const dist = levenshtein(skuUp, d.sku.toUpperCase());
-          if (dist < bestDist) {
-            bestDist = dist;
-            bestMatch = d;
-          }
-        }
-        if (bestDist <= 2 && bestMatch) {
-          return { ...bestMatch, matchType: `fuzzy (${bestDist} dif.)` };
-        }
-        
-        // 4. Partial: check if SKU starts/ends with a dict entry or vice versa
-        match = dictionary.find(d => 
-          skuUp.includes(d.sku.toUpperCase()) || d.sku.toUpperCase().includes(skuUp)
-        );
-        if (match && Math.abs(match.sku.length - skuUp.length) <= 3) {
-          return { ...match, matchType: "parcial" };
-        }
-        
-        return null;
-      };
-      
-      // Cross-reference with dictionary using fuzzy matching
+      // Cross-reference with dictionary - EXACT match only
       const enriched = (parsed.productos || []).map(p => {
-        const result = findBestMatch(p.sku);
+        const skuUp = (p.sku || "").toUpperCase().trim();
+        const match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
         return {
           ...p,
-          codigoML: result?.codigoML || "",
-          nombreDict: result?.nombre || "",
-          matched: !!result,
-          matchType: result?.matchType || "",
-          skuOriginal: result && result.sku !== (p.sku || "").toUpperCase() ? result.sku : ""
+          codigoML: match?.codigoML || "",
+          nombreDict: match?.nombre || "",
+          matched: !!match,
+          matchType: match ? "exacto" : "",
+          skuOriginal: ""
         };
       });
       
@@ -848,28 +790,8 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
   const lookupSku = useCallback((sku) => {
     if (!sku || dictionary.length === 0) return null;
     const skuUp = sku.toUpperCase().trim();
-    
-    // Exact
-    let match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
+    const match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
     if (match) return { ...match, matchType: "exacto" };
-    
-    // Normalized
-    const norm = (s) => (s || "").toUpperCase().replace(/[OÓ]/g,"0").replace(/[IÍ|L]/g,"1").replace(/[SŚ]/g,"5").replace(/[ZŹ]/g,"2").replace(/\s/g,"");
-    match = dictionary.find(d => norm(d.sku) === norm(sku));
-    if (match) return { ...match, matchType: "normalizado" };
-    
-    // Fuzzy (Levenshtein ≤ 2)
-    const lev = (a, b) => {
-      const m = a.length, n = b.length;
-      const dp = Array.from({length: m+1}, (_,i) => Array.from({length: n+1}, (_,j) => i===0?j:j===0?i:0));
-      for (let i=1;i<=m;i++) for (let j=1;j<=n;j++)
-        dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1] : 1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
-      return dp[m][n];
-    };
-    let best = 999, bestM = null;
-    for (const d of dictionary) { const dist = lev(skuUp, d.sku.toUpperCase()); if (dist < best) { best = dist; bestM = d; } }
-    if (best <= 2 && bestM) return { ...bestM, matchType: `fuzzy (${best} dif.)` };
-    
     return null;
   }, [dictionary]);
 
@@ -909,6 +831,67 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     setExtractedProducts(prev => [...prev, { sku: "", nombre: "", cantidad: 1, costo: 0, codigoML: "", confianza: "manual", matched: false }]);
     setEditingIdx(extractedProducts.length);
   };
+
+  // ---- Quick Mode: search & generate labels without photo ----
+  const quickSearchResults = React.useMemo(() => {
+    if (!quickSearch || quickSearch.length < 2 || dictionary.length === 0) return [];
+    const q = quickSearch.toUpperCase();
+    return dictionary.filter(d => 
+      d.sku.toUpperCase().includes(q) || 
+      (d.nombre || "").toUpperCase().includes(q) ||
+      (d.codigoML || "").toUpperCase().includes(q)
+    ).slice(0, 8);
+  }, [quickSearch, dictionary]);
+
+  const addQuickItem = useCallback((dictItem) => {
+    setQuickItems(prev => {
+      const existing = prev.findIndex(i => i.sku === dictItem.sku);
+      if (existing >= 0) {
+        const next = [...prev];
+        next[existing] = { ...next[existing], cantidad: next[existing].cantidad + 1 };
+        return next;
+      }
+      return [...prev, { ...dictItem, cantidad: 1 }];
+    });
+    setQuickSearch("");
+    if (quickSearchRef.current) quickSearchRef.current.focus();
+  }, []);
+
+  const updateQuickItem = useCallback((idx, field, value) => {
+    setQuickItems(prev => {
+      const next = [...prev];
+      next[idx] = { ...next[idx], [field]: field === "cantidad" ? Math.max(1, Number(value) || 1) : value };
+      return next;
+    });
+  }, []);
+
+  const removeQuickItem = useCallback((idx) => {
+    setQuickItems(prev => prev.filter((_, i) => i !== idx));
+  }, []);
+
+  const generateQuickLabels = useCallback(async () => {
+    if (quickItems.length === 0) return;
+    setProcessing(true);
+    setProcessingStatus("Generando etiquetas...");
+    setStep("processing");
+    
+    const products = quickItems.map(item => ({
+      sku: item.sku,
+      nombre: item.nombre,
+      nombreDict: item.nombre,
+      codigoML: item.codigoML,
+      cantidad: item.cantidad,
+      matched: true
+    }));
+    
+    setExtractedProducts(products);
+    setFolioFactura("RAPIDO");
+    
+    const pages = await generateLabelsPDF(products, "RAPIDO");
+    setLabelPages(pages);
+    setStep("labels");
+    setProcessing(false);
+  }, [quickItems]);
 
   // ---- Step indicator progress ----
   const stepIndex = STEPS.indexOf(step);
@@ -1009,6 +992,101 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
             >
               🚀 Procesar Factura
             </button>
+
+            {/* ---- Quick Mode: Generate labels without photo ---- */}
+            {hasDictionary && (
+              <div style={{marginTop: 24}}>
+                <div style={{display: "flex", alignItems: "center", gap: 12, marginBottom: 12}}>
+                  <div style={{flex: 1, height: 1, background: "#2A2A30"}}></div>
+                  <span style={{fontSize: 12, color: "#555", whiteSpace: "nowrap"}}>o genera etiquetas rápido</span>
+                  <div style={{flex: 1, height: 1, background: "#2A2A30"}}></div>
+                </div>
+
+                <div style={{position: "relative"}}>
+                  <input
+                    ref={quickSearchRef}
+                    style={{...styles.fieldInput, fontSize: 15, padding: "12px 14px", borderRadius: 12, width: "100%", border: "1px solid #2A2A30"}}
+                    placeholder="🔍 Buscar por SKU, nombre o código ML..."
+                    value={quickSearch}
+                    onChange={(e) => setQuickSearch(e.target.value)}
+                  />
+                  
+                  {/* Search results dropdown */}
+                  {quickSearchResults.length > 0 && (
+                    <div style={{
+                      position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50,
+                      background: "#1C1C20", border: "1px solid #333", borderRadius: 10,
+                      marginTop: 4, maxHeight: 280, overflow: "auto", boxShadow: "0 8px 24px rgba(0,0,0,0.5)"
+                    }}>
+                      {quickSearchResults.map((d, i) => (
+                        <div 
+                          key={i}
+                          onClick={() => addQuickItem(d)}
+                          style={{
+                            padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #222",
+                            transition: "background 0.15s"
+                          }}
+                          onMouseEnter={(e) => e.currentTarget.style.background = "#2A2A30"}
+                          onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                        >
+                          <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
+                            <span style={{fontFamily: "monospace", fontWeight: 700, fontSize: 13, color: "#E8E8EC"}}>{d.sku}</span>
+                            <span style={{fontFamily: "monospace", fontSize: 11, color: "#3B82F6"}}>{d.codigoML}</span>
+                          </div>
+                          <div style={{fontSize: 12, color: "#888", marginTop: 2}}>{d.nombre || ""}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Quick items list */}
+                {quickItems.length > 0 && (
+                  <div style={{marginTop: 12}}>
+                    {quickItems.map((item, idx) => (
+                      <div key={idx} style={{
+                        display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+                        background: "#141416", borderRadius: 10, marginBottom: 6,
+                        border: "1px solid rgba(34,197,94,0.2)"
+                      }}>
+                        <div style={{flex: 1, minWidth: 0}}>
+                          <div style={{fontSize: 12, fontWeight: 700, fontFamily: "monospace", color: "#E8E8EC"}}>
+                            {item.sku}
+                            <span style={{color: "#3B82F6", marginLeft: 8, fontWeight: 400}}>{item.codigoML}</span>
+                          </div>
+                          <div style={{fontSize: 11, color: "#888", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{item.nombre}</div>
+                        </div>
+                        <div style={{display: "flex", alignItems: "center", gap: 4}}>
+                          <button 
+                            style={{background: "#2A2A30", border: "none", color: "#AAA", width: 26, height: 26, borderRadius: 6, cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center"}}
+                            onClick={() => updateQuickItem(idx, "cantidad", item.cantidad - 1)}
+                          >−</button>
+                          <input
+                            style={{...styles.fieldInput, width: 42, textAlign: "center", padding: "4px 2px", fontSize: 14, fontWeight: 700}}
+                            type="number"
+                            value={item.cantidad}
+                            onChange={(e) => updateQuickItem(idx, "cantidad", e.target.value)}
+                            min="1"
+                          />
+                          <button 
+                            style={{background: "#2A2A30", border: "none", color: "#AAA", width: 26, height: 26, borderRadius: 6, cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center"}}
+                            onClick={() => updateQuickItem(idx, "cantidad", item.cantidad + 1)}
+                          >+</button>
+                        </div>
+                        <button style={styles.removeBtn} onClick={() => removeQuickItem(idx)}>✕</button>
+                      </div>
+                    ))}
+
+                    <button 
+                      style={{...styles.primaryBtn, background: "#22C55E", marginTop: 8}}
+                      onClick={generateQuickLabels}
+                    >
+                      🏷️ Generar {quickItems.reduce((s, i) => s + i.cantidad, 0)} Etiqueta{quickItems.reduce((s, i) => s + i.cantidad, 0) !== 1 ? "s" : ""}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -1087,8 +1165,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                     <div style={{display: "flex", gap: 6, alignItems: "center"}}>
                       {p.confianza === "baja" && <span style={styles.badgeDanger}>⚠ Baja conf.</span>}
                       {!p.matched && <span style={styles.badgeWarning}>Sin ML</span>}
-                      {p.matched && p.matchType === "exacto" && <span style={styles.badgeSuccess}>✓ ML</span>}
-                      {p.matched && p.matchType !== "exacto" && <span style={{...styles.badgeSuccess, background: "rgba(59,130,246,0.12)", color: "#3B82F6"}}>~ {p.matchType}</span>}
+                      {p.matched && <span style={styles.badgeSuccess}>✓ ML</span>}
                       <button style={styles.removeBtn} onClick={() => removeProduct(idx)}>✕</button>
                     </div>
                   </div>
@@ -1100,7 +1177,6 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                       {p.nombre && p.nombre !== p.nombreDict && (
                         <div style={{fontSize: 11, color: "#555", marginTop: 2}}>Factura: {p.nombre}</div>
                       )}
-                      {p.skuOriginal && <div style={{fontSize: 11, color: "#3B82F6", marginTop: 2}}>SKU corregido: {p.skuOriginal}</div>}
                     </div>
                   ) : (
                     <div style={{marginBottom: 8}}>
@@ -1207,6 +1283,8 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 setExtractedProducts([]);
                 setLabelPages([]);
                 setFolioFactura("");
+                setQuickItems([]);
+                setQuickSearch("");
               }}>
                 📄 Nueva Factura
               </button>
