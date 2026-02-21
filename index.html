@@ -295,7 +295,7 @@ function generateLabelsPDF(products, folioFactura) {
         
         // Cod. Universal: SKU at bottom
         ctx.font = `bold ${2.8 * MM}px Arial, Helvetica, sans-serif`;
-        ctx.fillText(`Cod. Universal: ${product.sku || ""}`, LABEL_W / 2, 32.5 * MM);
+        ctx.fillText(`Cod. Universal: ${product.skuVenta || product.sku || ""}`, LABEL_W / 2, 32.5 * MM);
         
         // Folio tiny at bottom-right
         if (folioFactura) {
@@ -349,19 +349,118 @@ function App() {
   const [quickSearch, setQuickSearch] = useState("");
   const [quickItems, setQuickItems] = useState([]);
   const quickSearchRef = useRef(null);
+  const [sheetUrl, setSheetUrl] = useState("");
+  const [sheetLoading, setSheetLoading] = useState(false);
+  const [sheetStatus, setSheetStatus] = useState(""); // "ok", "error", ""
+  const [lastSync, setLastSync] = useState("");
   
-  // Load dictionary from localStorage on mount
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem("banva_dict");
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setDictionary(parsed);
-          setHasDictionary(true);
+  // Parse CSV text into dictionary array
+  // Format: Col A=SKU Venta, B=Código ML, C=Nombre, D=?, E=SKU Proveedor, F=Cant Pack
+  const parseCSV = useCallback((text) => {
+    const lines = text.split("\n").filter(l => l.trim());
+    const dict = [];
+    
+    for (let i = 0; i < lines.length; i++) {
+      let parts;
+      // Handle CSV with quotes
+      if (lines[i].includes('"')) {
+        parts = [];
+        let current = "";
+        let inQuotes = false;
+        for (const ch of lines[i]) {
+          if (ch === '"') { inQuotes = !inQuotes; }
+          else if (ch === ',' && !inQuotes) { parts.push(current.trim()); current = ""; }
+          else { current += ch; }
         }
+        parts.push(current.trim());
+      } else if (lines[i].includes("\t")) { parts = lines[i].split("\t"); }
+      else if (lines[i].includes(";")) { parts = lines[i].split(";"); }
+      else { parts = lines[i].split(","); }
+      
+      parts = parts.map(p => p.trim());
+      
+      // Skip header row
+      if (i === 0 && (parts[0]?.toLowerCase().includes("sku") || parts[0]?.toLowerCase().includes("codigo"))) continue;
+      
+      // Detect format: if 5+ columns, use Sheet format (A=skuVenta, B=codigoML, C=nombre, E=skuProveedor, F=cantPack)
+      if (parts.length >= 5) {
+        const skuVenta = parts[0] || "";
+        const codigoML = parts[1] || "";
+        const nombre = parts[2] || "";
+        const skuProveedor = parts[4] || "";
+        const cantPack = parseInt(parts[5]) || 1;
+        
+        if (codigoML) {
+          dict.push({ 
+            sku: skuProveedor || skuVenta,  // SKU proveedor for invoice matching
+            skuVenta: skuVenta,              // SKU venta for label "Cod. Universal"
+            codigoML, 
+            nombre,
+            cantPack,
+            isPack: cantPack > 1
+          });
+        }
+      } else if (parts.length >= 2) {
+        // Simple format: SKU, Código ML, Nombre
+        const sku = parts[0];
+        const codigoML = parts[1];
+        const nombre = parts.length > 2 ? parts[2] : "";
+        if (sku && codigoML) dict.push({ sku, skuVenta: sku, codigoML, nombre, cantPack: 1, isPack: false });
       }
-    } catch(e) { console.log("No saved dictionary"); }
+    }
+    return dict;
+  }, []);
+
+  // Fetch dictionary from Google Sheet
+  const fetchFromSheet = useCallback(async (url) => {
+    if (!url) return;
+    setSheetLoading(true);
+    setSheetStatus("");
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("No se pudo acceder al Sheet");
+      const text = await res.text();
+      const dict = parseCSV(text);
+      if (dict.length === 0) throw new Error("No se encontraron productos en el Sheet");
+      
+      setDictionary(dict);
+      setHasDictionary(true);
+      setSheetStatus("ok");
+      setLastSync(new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" }));
+      
+      // Cache in localStorage
+      try { 
+        localStorage.setItem("banva_dict", JSON.stringify(dict));
+        localStorage.setItem("banva_sheet_url", url);
+        localStorage.setItem("banva_last_sync", new Date().toISOString());
+      } catch(e) {}
+    } catch(err) {
+      console.error("Sheet fetch error:", err);
+      setSheetStatus("error");
+      setError("Error cargando Sheet: " + err.message);
+    } finally {
+      setSheetLoading(false);
+    }
+  }, [parseCSV]);
+
+  // Load dictionary: try Google Sheet first, fallback to localStorage
+  useEffect(() => {
+    const savedUrl = localStorage.getItem("banva_sheet_url");
+    if (savedUrl) {
+      setSheetUrl(savedUrl);
+      fetchFromSheet(savedUrl);
+    } else {
+      try {
+        const saved = localStorage.getItem("banva_dict");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setDictionary(parsed);
+            setHasDictionary(true);
+          }
+        }
+      } catch(e) {}
+    }
   }, []);
 
   // Save dictionary to localStorage when it changes
@@ -435,37 +534,16 @@ function App() {
   }, []);
 
   const parseDictionary = useCallback((text) => {
-    const lines = text.split("\n").filter(l => l.trim());
-    const dict = [];
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      let parts;
-      if (line.includes("\t")) parts = line.split("\t");
-      else if (line.includes("|")) parts = line.split("|");
-      else if (line.includes(";")) parts = line.split(";");
-      else if (line.includes(",")) parts = line.split(",");
-      else continue;
-      
-      parts = parts.map(p => p.trim());
-      if (parts.length < 2) continue;
-      
-      // Skip header row
-      if (i === 0 && (parts[0].toLowerCase().includes("sku") || parts[0].toLowerCase().includes("codigo"))) continue;
-      
-      const sku = parts[0];
-      const codigoML = parts[1];
-      const nombre = parts.length > 2 ? parts[2] : "";
-      
-      if (sku && codigoML) {
-        dict.push({ sku, codigoML, nombre });
-      }
+    const dict = parseCSV(text);
+    if (dict.length > 0) {
+      setDictionary(dict);
+      setHasDictionary(true);
+      setShowDictModal(false);
+      try { localStorage.setItem("banva_dict", JSON.stringify(dict)); } catch(e) {}
+    } else {
+      setError("No se encontraron productos válidos en el texto.");
     }
-    
-    setDictionary(dict);
-    setHasDictionary(dict.length > 0);
-    setShowDictModal(false);
-  }, []);
+  }, [parseCSV]);
 
   // ---- AI Processing ----
   const processInvoice = useCallback(async () => {
@@ -558,13 +636,19 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
       // Cross-reference with dictionary - EXACT match only
       const enriched = (parsed.productos || []).map(p => {
         const skuUp = (p.sku || "").toUpperCase().trim();
-        const match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
+        // Find ALL matches (same SKU proveedor can have multiple products: pack vs individual)
+        const matches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+        const match = matches[0] || null;
         return {
           ...p,
           codigoML: match?.codigoML || "",
           nombreDict: match?.nombre || "",
+          skuVenta: match?.skuVenta || "",
+          cantPack: match?.cantPack || 1,
+          isPack: match?.isPack || false,
           matched: !!match,
           matchType: match ? "exacto" : "",
+          altCount: matches.length > 1 ? matches.length : 0,  // number of alternative matches
           skuOriginal: ""
         };
       });
@@ -703,7 +787,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
       catUnits += p.cantidad;
       
       tableRows += `<tr style="background:${idx % 2 === 0 ? '#fff' : '#fafafa'};">
-        <td style="padding:6px 10px;border:1px solid #eee;font-family:monospace;font-weight:600;">${p.sku || ""}</td>
+        <td style="padding:6px 10px;border:1px solid #eee;font-family:monospace;font-weight:600;">${p.skuVenta || p.sku || ""}</td>
         <td style="padding:6px 10px;border:1px solid #eee;font-family:monospace;font-weight:600;color:#2563EB;">${p.codigoML}</td>
         <td style="padding:6px 10px;border:1px solid #eee;font-size:12px;">${p.nombreDict || p.nombre || ""}</td>
         <td style="padding:6px 10px;border:1px solid #eee;text-align:center;">${cat}</td>
@@ -802,6 +886,9 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     const skuUp = sku.toUpperCase().trim();
     const match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
     if (match) return { ...match, matchType: "exacto" };
+    // Also try matching against skuVenta
+    const matchVenta = dictionary.find(d => (d.skuVenta || "").toUpperCase() === skuUp);
+    if (matchVenta) return { ...matchVenta, matchType: "exacto" };
     return null;
   }, [dictionary]);
 
@@ -816,12 +903,16 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
         if (result) {
           updated.codigoML = result.codigoML;
           updated.nombreDict = result.nombre;
+          updated.skuVenta = result.skuVenta || "";
+          updated.cantPack = result.cantPack || 1;
+          updated.isPack = result.isPack || false;
           updated.matched = true;
           updated.matchType = result.matchType;
           updated.skuOriginal = result.sku !== value.toUpperCase() ? result.sku : "";
         } else {
           updated.codigoML = "";
           updated.nombreDict = "";
+          updated.skuVenta = "";
           updated.matched = false;
           updated.matchType = "";
           updated.skuOriginal = "";
@@ -848,14 +939,15 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     const q = quickSearch.toUpperCase();
     return dictionary.filter(d => 
       d.sku.toUpperCase().includes(q) || 
+      (d.skuVenta || "").toUpperCase().includes(q) ||
       (d.nombre || "").toUpperCase().includes(q) ||
       (d.codigoML || "").toUpperCase().includes(q)
-    ).slice(0, 8);
+    ).slice(0, 10);
   }, [quickSearch, dictionary]);
 
   const addQuickItem = useCallback((dictItem) => {
     setQuickItems(prev => {
-      const existing = prev.findIndex(i => i.sku === dictItem.sku);
+      const existing = prev.findIndex(i => i.codigoML === dictItem.codigoML);
       if (existing >= 0) {
         const next = [...prev];
         next[existing] = { ...next[existing], cantidad: next[existing].cantidad + 1 };
@@ -887,6 +979,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     
     const products = quickItems.map(item => ({
       sku: item.sku,
+      skuVenta: item.skuVenta || item.sku,
       nombre: item.nombre,
       nombreDict: item.nombre,
       codigoML: item.codigoML,
@@ -918,8 +1011,11 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
             <span style={styles.logoAccent}>BANVA</span>
             <span style={styles.logoSub}>Factura → Etiquetas</span>
           </h1>
-          <button style={styles.dictBtn} onClick={() => setShowDictModal(true)}>
-            {hasDictionary ? `📗 ${dictionary.length} SKUs` : "📕 Cargar Diccionario"}
+          <button style={{...styles.dictBtn, borderColor: sheetUrl ? "rgba(34,197,94,0.3)" : "#2A2A30"}} onClick={() => setShowDictModal(true)}>
+            {hasDictionary 
+              ? `${sheetUrl ? "📊" : "📗"} ${dictionary.length} SKUs` 
+              : "📕 Cargar Diccionario"
+            }
           </button>
         </div>
         
@@ -1040,10 +1136,16 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                           onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
                         >
                           <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
-                            <span style={{fontFamily: "monospace", fontWeight: 700, fontSize: 13, color: "#E8E8EC"}}>{d.sku}</span>
+                            <span style={{fontFamily: "monospace", fontWeight: 700, fontSize: 13, color: "#E8E8EC"}}>
+                              {d.skuVenta || d.sku}
+                              {d.isPack && <span style={{fontSize: 10, color: "#F59E0B", marginLeft: 6}}>📦 Pack x{d.cantPack}</span>}
+                            </span>
                             <span style={{fontFamily: "monospace", fontSize: 11, color: "#3B82F6"}}>{d.codigoML}</span>
                           </div>
-                          <div style={{fontSize: 12, color: "#888", marginTop: 2}}>{d.nombre || ""}</div>
+                          <div style={{fontSize: 12, color: "#888", marginTop: 2}}>
+                            {d.nombre || ""}
+                            {d.sku !== d.skuVenta && d.skuVenta && <span style={{color: "#555", marginLeft: 6, fontSize: 10}}>SKU prov: {d.sku}</span>}
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -1061,8 +1163,9 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                       }}>
                         <div style={{flex: 1, minWidth: 0}}>
                           <div style={{fontSize: 12, fontWeight: 700, fontFamily: "monospace", color: "#E8E8EC"}}>
-                            {item.sku}
+                            {item.skuVenta || item.sku}
                             <span style={{color: "#3B82F6", marginLeft: 8, fontWeight: 400}}>{item.codigoML}</span>
+                            {item.isPack && <span style={{color: "#F59E0B", marginLeft: 6, fontSize: 10}}>📦x{item.cantPack}</span>}
                           </div>
                           <div style={{fontSize: 11, color: "#888", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{item.nombre}</div>
                         </div>
@@ -1176,6 +1279,8 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                       {p.confianza === "baja" && <span style={styles.badgeDanger}>⚠ Baja conf.</span>}
                       {!p.matched && <span style={styles.badgeWarning}>Sin ML</span>}
                       {p.matched && <span style={styles.badgeSuccess}>✓ ML</span>}
+                      {p.isPack && <span style={{...styles.badgeSuccess, background: "rgba(245,158,11,0.12)", color: "#F59E0B"}}>📦 Pack x{p.cantPack}</span>}
+                      {p.altCount > 1 && <span style={{...styles.badgeSuccess, background: "rgba(139,92,246,0.12)", color: "#8B5CF6"}}>⚠ {p.altCount} variantes</span>}
                       <button style={styles.removeBtn} onClick={() => removeProduct(idx)}>✕</button>
                     </div>
                   </div>
@@ -1186,6 +1291,9 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                       <div style={{fontSize: 13, color: "#22C55E", fontWeight: 600}}>✓ {p.nombreDict}</div>
                       {p.nombre && p.nombre !== p.nombreDict && (
                         <div style={{fontSize: 11, color: "#555", marginTop: 2}}>Factura: {p.nombre}</div>
+                      )}
+                      {p.skuVenta && p.skuVenta !== p.sku && (
+                        <div style={{fontSize: 11, color: "#3B82F6", marginTop: 2}}>SKU Venta: {p.skuVenta}</div>
                       )}
                     </div>
                   ) : (
@@ -1311,54 +1419,133 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
               <h3>📗 Diccionario SKU ↔ Código ML</h3>
               <button style={styles.modalClose} onClick={() => setShowDictModal(false)}>✕</button>
             </div>
-            
-            <p style={{fontSize: 13, color: "#999", margin: "12px 0"}}>
-              Carga tu diccionario para que el sistema cruce automáticamente los SKUs con los códigos ML.
-            </p>
 
+            {/* ---- Google Sheets Connection ---- */}
+            <div style={{marginTop: 14, padding: 14, background: "#0d1117", borderRadius: 12, border: sheetUrl ? "1px solid rgba(34,197,94,0.3)" : "1px solid #2A2A30"}}>
+              <div style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 10}}>
+                <span style={{fontSize: 20}}>📊</span>
+                <div>
+                  <div style={{fontSize: 14, fontWeight: 600}}>Google Sheets (recomendado)</div>
+                  <div style={{fontSize: 11, color: "#888"}}>Se sincroniza automáticamente al abrir la app</div>
+                </div>
+              </div>
+
+              <input
+                style={{...styles.fieldInput, fontSize: 12, padding: "10px 12px", borderRadius: 8, width: "100%", marginBottom: 8}}
+                placeholder="Pega la URL de tu Google Sheet publicado..."
+                value={sheetUrl}
+                onChange={(e) => setSheetUrl(e.target.value)}
+              />
+
+              <div style={{display: "flex", gap: 8}}>
+                <button 
+                  style={{...styles.primaryBtn, flex: 1, padding: "10px", fontSize: 13, opacity: sheetUrl ? 1 : 0.4}}
+                  disabled={!sheetUrl || sheetLoading}
+                  onClick={() => {
+                    localStorage.setItem("banva_sheet_url", sheetUrl);
+                    fetchFromSheet(sheetUrl);
+                  }}
+                >
+                  {sheetLoading ? "⏳ Cargando..." : "🔄 Sincronizar"}
+                </button>
+                {sheetUrl && (
+                  <button 
+                    style={{...styles.secondaryBtn, padding: "10px", fontSize: 12}}
+                    onClick={() => {
+                      setSheetUrl("");
+                      localStorage.removeItem("banva_sheet_url");
+                      localStorage.removeItem("banva_last_sync");
+                      setSheetStatus("");
+                      setLastSync("");
+                    }}
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+
+              {sheetStatus === "ok" && (
+                <div style={{fontSize: 11, color: "#22C55E", marginTop: 8}}>
+                  ✅ Sincronizado: {dictionary.length} productos — última sync: {lastSync}
+                </div>
+              )}
+              {sheetStatus === "error" && (
+                <div style={{fontSize: 11, color: "#EF4444", marginTop: 8}}>
+                  ❌ Error al cargar. Verifica que el Sheet esté publicado como CSV.
+                </div>
+              )}
+
+              <details style={{marginTop: 10}}>
+                <summary style={{fontSize: 11, color: "#666", cursor: "pointer"}}>¿Cómo publicar tu Google Sheet?</summary>
+                <ol style={{fontSize: 11, color: "#888", margin: "8px 0 0", paddingLeft: 18, lineHeight: 1.8}}>
+                  <li>Abre tu Google Sheet con columnas: <b>SKU | Código ML | Nombre</b></li>
+                  <li>Menú <b>Archivo → Compartir → Publicar en la web</b></li>
+                  <li>Selecciona la hoja y formato <b>CSV</b></li>
+                  <li>Click <b>Publicar</b> y copia la URL</li>
+                  <li>Pega la URL arriba y click Sincronizar</li>
+                </ol>
+              </details>
+            </div>
+
+            {/* ---- Divider ---- */}
+            <div style={{display: "flex", alignItems: "center", gap: 12, margin: "16px 0"}}>
+              <div style={{flex: 1, height: 1, background: "#2A2A30"}}></div>
+              <span style={{fontSize: 11, color: "#444"}}>o carga manual</span>
+              <div style={{flex: 1, height: 1, background: "#2A2A30"}}></div>
+            </div>
+
+            {/* ---- Manual upload ---- */}
             <div 
               style={styles.dictUploadZone}
               onClick={() => dictInputRef.current?.click()}
             >
-              <div style={{fontSize: 32}}>📄</div>
-              <p style={{fontSize: 13}}>Subir archivo CSV / Excel</p>
-              <p style={{fontSize: 11, color: "#666"}}>Formato: SKU, Código ML, Nombre (opcional)</p>
+              <div style={{fontSize: 24}}>📄</div>
+              <p style={{fontSize: 12, margin: "4px 0 0"}}>Subir archivo CSV / Excel</p>
               <input ref={dictInputRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls" onChange={handleDictUpload} style={{display: "none"}} />
             </div>
 
-            <div style={{margin: "16px 0 8px", fontSize: 12, color: "#666", textAlign: "center"}}>— o pega el contenido —</div>
-
             <textarea
-              style={styles.dictTextarea}
-              placeholder={"SKU\tCódigo ML\tNombre\nJSAFAB413P20W\tLXXI15548\tSabanas AF 144H\nTXV23QLAT20BC\tXZBN29596\tQuilt Atenas Blanco SK"}
+              style={{...styles.dictTextarea, marginTop: 10}}
+              placeholder={"SKU\tCódigo ML\tNombre\nJSAFAB413P20W\tLXXI15548\tSabanas AF 144H"}
               value={dictText}
               onChange={(e) => setDictText(e.target.value)}
-              rows={8}
+              rows={4}
             />
 
-            <div style={{display: "flex", gap: 10, marginTop: 12}}>
-              <button style={styles.secondaryBtn} onClick={() => setShowDictModal(false)}>Cancelar</button>
+            <div style={{display: "flex", gap: 10, marginTop: 8}}>
+              <button style={styles.secondaryBtn} onClick={() => setShowDictModal(false)}>Cerrar</button>
               <button 
                 style={{...styles.primaryBtn, flex: 1}}
                 onClick={() => parseDictionary(dictText)}
                 disabled={!dictText.trim()}
               >
-                Cargar ({dictText.split("\n").filter(l => l.trim()).length - 1} items)
+                Cargar texto ({dictText.split("\n").filter(l => l.trim()).length - 1} items)
               </button>
             </div>
 
+            {/* ---- Current dictionary status ---- */}
             {hasDictionary && (
-              <div style={{marginTop: 16, padding: 12, background: "#0f2d0f", borderRadius: 10, border: "1px solid rgba(34,197,94,0.3)"}}>
-                <p style={{fontSize: 13, color: "#22C55E"}}>
-                  ✅ Diccionario actual: {dictionary.length} productos cargados
-                </p>
-                <div style={{maxHeight: 150, overflow: "auto", marginTop: 8}}>
-                  {dictionary.slice(0, 10).map((d, i) => (
+              <div style={{marginTop: 14, padding: 12, background: "#0f2d0f", borderRadius: 10, border: "1px solid rgba(34,197,94,0.3)"}}>
+                <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
+                  <p style={{fontSize: 13, color: "#22C55E", margin: 0}}>
+                    ✅ {dictionary.length} productos cargados
+                  </p>
+                  {sheetUrl && (
+                    <button 
+                      style={{background: "none", border: "none", color: "#3B82F6", fontSize: 12, cursor: "pointer", fontFamily: "inherit"}}
+                      onClick={() => fetchFromSheet(sheetUrl)}
+                    >
+                      🔄 Refrescar
+                    </button>
+                  )}
+                </div>
+                <div style={{maxHeight: 120, overflow: "auto", marginTop: 8}}>
+                  {dictionary.slice(0, 8).map((d, i) => (
                     <div key={i} style={{fontSize: 11, color: "#888", fontFamily: "monospace", padding: "2px 0"}}>
-                      {d.sku} → {d.codigoML} {d.nombre ? `(${d.nombre})` : ""}
+                      {d.sku}{d.skuVenta && d.skuVenta !== d.sku ? ` (venta: ${d.skuVenta})` : ""} → {d.codigoML} {d.nombre ? `— ${d.nombre}` : ""}{d.isPack ? ` 📦x${d.cantPack}` : ""}
                     </div>
                   ))}
-                  {dictionary.length > 10 && <div style={{fontSize: 11, color: "#666"}}>... y {dictionary.length - 10} más</div>}
+                  {dictionary.length > 8 && <div style={{fontSize: 11, color: "#666"}}>... y {dictionary.length - 8} más</div>}
                 </div>
               </div>
             )}
