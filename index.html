@@ -338,6 +338,13 @@ function App() {
   const [hasDictionary, setHasDictionary] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [processingStatus, setProcessingStatus] = useState("");
+
+  // Admin mode
+  const ADMIN_PIN = "1234"; // Cambia esto a tu PIN
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showPinModal, setShowPinModal] = useState(false);
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState(false);
   const [labelPages, setLabelPages] = useState([]);
   const [error, setError] = useState(null);
   const [editingIdx, setEditingIdx] = useState(null);
@@ -1032,7 +1039,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
             <span style={styles.logoSub}>Factura → Etiquetas</span>
           </h1>
           <div style={{display: "flex", gap: 6, alignItems: "center"}}>
-            {sheetUrl && (
+            {sheetUrl && isAdmin && (
               <button 
                 style={{...styles.dictBtn, padding: "6px 10px", fontSize: 14, borderColor: "rgba(59,130,246,0.3)"}} 
                 onClick={() => fetchFromSheet(sheetUrl)}
@@ -1041,11 +1048,27 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 {sheetLoading ? "⏳" : "🔄"}
               </button>
             )}
-            <button style={{...styles.dictBtn, borderColor: sheetUrl ? "rgba(34,197,94,0.3)" : "#2A2A30"}} onClick={() => setShowDictModal(true)}>
-              {hasDictionary 
-                ? `${sheetUrl ? "📊" : "📗"} ${dictionary.length} SKUs` 
-                : "📕 Cargar Diccionario"
-              }
+            {isAdmin ? (
+              <button style={{...styles.dictBtn, borderColor: sheetUrl ? "rgba(34,197,94,0.3)" : "#2A2A30"}} onClick={() => setShowDictModal(true)}>
+                {hasDictionary 
+                  ? `${sheetUrl ? "📊" : "📗"} ${dictionary.length} SKUs` 
+                  : "📕 Cargar Diccionario"
+                }
+              </button>
+            ) : (
+              <span style={{fontSize: 12, color: "#666", padding: "6px 10px"}}>
+                {hasDictionary ? `📊 ${dictionary.length} SKUs` : ""}
+              </span>
+            )}
+            <button 
+              style={{...styles.dictBtn, padding: "6px 10px", fontSize: 14, borderColor: isAdmin ? "rgba(34,197,94,0.3)" : "#2A2A30"}} 
+              onClick={() => {
+                if (isAdmin) { setIsAdmin(false); } 
+                else { setShowPinModal(true); setPinInput(""); setPinError(false); }
+              }}
+              title={isAdmin ? "Cerrar modo admin" : "Modo admin"}
+            >
+              {isAdmin ? "🔓" : "🔒"}
             </button>
           </div>
         </div>
@@ -1466,6 +1489,59 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
           </div>
         )}
       </div>
+
+      {/* ====================== PIN MODAL ====================== */}
+      {showPinModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowPinModal(false)}>
+          <div style={{...styles.modal, maxWidth: 320, textAlign: "center"}} onClick={(e) => e.stopPropagation()}>
+            <div style={{fontSize: 48, marginBottom: 12}}>🔒</div>
+            <h3 style={{margin: "0 0 8px", fontSize: 16}}>Modo Administrador</h3>
+            <p style={{fontSize: 12, color: "#888", margin: "0 0 16px"}}>Ingresa el PIN para acceder a la configuración</p>
+            <input
+              type="password"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={6}
+              autoFocus
+              style={{
+                ...styles.fieldInput, fontSize: 24, textAlign: "center", letterSpacing: 8,
+                padding: "12px", borderRadius: 10, width: "100%",
+                borderColor: pinError ? "#EF4444" : "#2A2A30"
+              }}
+              value={pinInput}
+              onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (pinInput === ADMIN_PIN) {
+                    setIsAdmin(true);
+                    setShowPinModal(false);
+                  } else {
+                    setPinError(true);
+                  }
+                }
+              }}
+              placeholder="••••"
+            />
+            {pinError && <p style={{fontSize: 12, color: "#EF4444", margin: "8px 0 0"}}>PIN incorrecto</p>}
+            <div style={{display: "flex", gap: 10, marginTop: 16}}>
+              <button style={styles.secondaryBtn} onClick={() => setShowPinModal(false)}>Cancelar</button>
+              <button 
+                style={{...styles.primaryBtn, flex: 1}}
+                onClick={() => {
+                  if (pinInput === ADMIN_PIN) {
+                    setIsAdmin(true);
+                    setShowPinModal(false);
+                  } else {
+                    setPinError(true);
+                  }
+                }}
+              >
+                Desbloquear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ====================== DICTIONARY MODAL ====================== */}
       {showDictModal && (
