@@ -456,24 +456,14 @@ function App() {
     }
   }, [parseCSV]);
 
-  // Load dictionary: try Google Sheet first, fallback to localStorage
+  // Default Google Sheet URL (loads on all devices automatically)
+  const DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQZxKcXM-OaJ5_B-lEM87PPy9B4675FRFLfpWtL-ZhTqpalZNqODq18XFY2C4txj7fXc5n1jYZSTWrJ/pub?gid=348421726&single=true&output=csv";
+
+  // Load dictionary: always fetch from Sheet
   useEffect(() => {
-    const savedUrl = localStorage.getItem("banva_sheet_url");
-    if (savedUrl) {
-      setSheetUrl(savedUrl);
-      fetchFromSheet(savedUrl);
-    } else {
-      try {
-        const saved = localStorage.getItem("banva_dict");
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setDictionary(parsed);
-            setHasDictionary(true);
-          }
-        }
-      } catch(e) {}
-    }
+    const url = localStorage.getItem("banva_sheet_url") || DEFAULT_SHEET_URL;
+    setSheetUrl(url);
+    fetchFromSheet(url);
   }, []);
 
   // Save dictionary to localStorage when it changes
