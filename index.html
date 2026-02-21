@@ -22,6 +22,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
 
 <script type="text/babel">
 const { useState, useRef, useCallback, useEffect } = React;
@@ -219,64 +220,55 @@ function generateLabelsPDF(products, folioFactura) {
       
       // ---- ACTUAL LABELS (one per unit) ----
       for (let i = 0; i < product.cantidad; i++) {
-        // Use 2x resolution for crisp barcodes
-        const SCALE = 2;
         const canvas = document.createElement("canvas");
-        canvas.width = LABEL_W * SCALE;
-        canvas.height = LABEL_H * SCALE;
+        canvas.width = LABEL_W;
+        canvas.height = LABEL_H;
         const ctx = canvas.getContext("2d");
-        ctx.scale(SCALE, SCALE);
-        
-        // Disable anti-aliasing for sharp barcode lines
-        ctx.imageSmoothingEnabled = false;
         
         // White background
         ctx.fillStyle = "#FFFFFF";
         ctx.fillRect(0, 0, LABEL_W, LABEL_H);
         
-        // Barcode at top - wider and taller for better scanning
-        const barcodeText = product.codigoML;
-        const bits = Code128.encode(barcodeText);
-        const barcodeWidth = 52 * MM;
-        const barcodeHeight = 13 * MM;
-        const barcodeX = (LABEL_W - barcodeWidth) / 2;
-        const barcodeY = 1.5 * MM;
-        
-        // Calculate exact bar widths - no overlap
-        const totalBits = bits.length;
-        const moduleWidth = barcodeWidth / totalBits;
-        
-        ctx.fillStyle = "#000000";
-        // Group consecutive 1s into single rectangles for crisp rendering
-        let runStart = -1;
-        for (let b = 0; b <= totalBits; b++) {
-          if (b < totalBits && bits[b] === "1") {
-            if (runStart === -1) runStart = b;
-          } else {
-            if (runStart !== -1) {
-              const x = Math.round((barcodeX + runStart * moduleWidth) * SCALE) / SCALE;
-              const w = Math.round(((b - runStart) * moduleWidth) * SCALE) / SCALE;
-              ctx.fillRect(x, barcodeY, w, barcodeHeight);
-              runStart = -1;
-            }
-          }
+        // Generate barcode using JsBarcode on a temp canvas
+        const bcCanvas = document.createElement("canvas");
+        try {
+          JsBarcode(bcCanvas, product.codigoML, {
+            format: "CODE128",
+            width: 3,
+            height: 150,
+            displayValue: false,
+            margin: 0,
+            background: "#FFFFFF",
+            lineColor: "#000000"
+          });
+        } catch(e) {
+          console.error("Barcode error:", e);
         }
+        
+        // Draw barcode centered on label
+        const bcTargetW = 52 * MM;
+        const bcTargetH = 12 * MM;
+        const bcX = (LABEL_W - bcTargetW) / 2;
+        const bcY = 1.5 * MM;
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(bcCanvas, bcX, bcY, bcTargetW, bcTargetH);
+        ctx.imageSmoothingEnabled = true;
         
         // Código ML big below barcode
         ctx.fillStyle = "#000000";
         ctx.font = `bold ${5 * MM}px Arial, Helvetica, sans-serif`;
         ctx.textAlign = "center";
-        ctx.fillText(product.codigoML, LABEL_W / 2, 18 * MM);
+        ctx.fillText(product.codigoML, LABEL_W / 2, 17.5 * MM);
         
         // Separator line
         ctx.strokeStyle = "#CCCCCC";
         ctx.lineWidth = 0.3 * MM;
         ctx.beginPath();
-        ctx.moveTo(4 * MM, 20 * MM);
-        ctx.lineTo(LABEL_W - 4 * MM, 20 * MM);
+        ctx.moveTo(4 * MM, 19.5 * MM);
+        ctx.lineTo(LABEL_W - 4 * MM, 19.5 * MM);
         ctx.stroke();
         
-        // Product name (smaller, may wrap)
+        // Product name
         ctx.font = `${2.3 * MM}px Arial, Helvetica, sans-serif`;
         ctx.fillStyle = "#000000";
         let labelName = nombre;
@@ -285,25 +277,25 @@ function generateLabelsPDF(products, folioFactura) {
           const l1 = labelName.substring(0, mid > 0 ? mid : 48);
           const l2 = labelName.substring(mid > 0 ? mid + 1 : 48);
           if (l2.length > 48) {
-            ctx.fillText(l1, LABEL_W / 2, 23 * MM);
-            ctx.fillText(l2.substring(0, 48) + "...", LABEL_W / 2, 26 * MM);
+            ctx.fillText(l1, LABEL_W / 2, 22.5 * MM);
+            ctx.fillText(l2.substring(0, 48) + "...", LABEL_W / 2, 25.5 * MM);
           } else {
-            ctx.fillText(l1, LABEL_W / 2, 23 * MM);
-            ctx.fillText(l2, LABEL_W / 2, 26 * MM);
+            ctx.fillText(l1, LABEL_W / 2, 22.5 * MM);
+            ctx.fillText(l2, LABEL_W / 2, 25.5 * MM);
           }
         } else {
-          ctx.fillText(labelName, LABEL_W / 2, 24 * MM);
+          ctx.fillText(labelName, LABEL_W / 2, 23.5 * MM);
         }
         
         // Separator line before SKU
         ctx.beginPath();
-        ctx.moveTo(4 * MM, 28 * MM);
-        ctx.lineTo(LABEL_W - 4 * MM, 28 * MM);
+        ctx.moveTo(4 * MM, 28.5 * MM);
+        ctx.lineTo(LABEL_W - 4 * MM, 28.5 * MM);
         ctx.stroke();
         
         // Cod. Universal: SKU at bottom
         ctx.font = `bold ${2.8 * MM}px Arial, Helvetica, sans-serif`;
-        ctx.fillText(`Cod. Universal: ${product.sku || ""}`, LABEL_W / 2, 32 * MM);
+        ctx.fillText(`Cod. Universal: ${product.sku || ""}`, LABEL_W / 2, 32.5 * MM);
         
         // Folio tiny at bottom-right
         if (folioFactura) {
