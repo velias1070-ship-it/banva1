@@ -355,6 +355,7 @@ function App() {
   const [lastSync, setLastSync] = useState("");
   const [showCatSeparators, setShowCatSeparators] = useState(true);
   const [showProdSeparators, setShowProdSeparators] = useState(true);
+  const lastSyncTime = useRef(0);
   
   // Parse CSV text into dictionary array
   // Format: Col A=SKU Venta, B=Código ML, C=Nombre, D=?, E=SKU Proveedor, F=Cant Pack
@@ -431,6 +432,7 @@ function App() {
       setHasDictionary(true);
       setSheetStatus("ok");
       setLastSync(new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" }));
+      lastSyncTime.current = Date.now();
       
       // Cache in localStorage
       try { 
@@ -1007,6 +1009,13 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     setProcessing(false);
   }, [quickItems, showCatSeparators, showProdSeparators]);
 
+  // Auto-sync with cooldown (refresh if >60s since last sync)
+  const autoSync = useCallback(() => {
+    if (sheetUrl && !sheetLoading && (Date.now() - lastSyncTime.current > 60000)) {
+      fetchFromSheet(sheetUrl);
+    }
+  }, [sheetUrl, sheetLoading, fetchFromSheet]);
+
   // ---- Step indicator progress ----
   const stepIndex = STEPS.indexOf(step);
 
@@ -1022,12 +1031,23 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
             <span style={styles.logoAccent}>BANVA</span>
             <span style={styles.logoSub}>Factura → Etiquetas</span>
           </h1>
-          <button style={{...styles.dictBtn, borderColor: sheetUrl ? "rgba(34,197,94,0.3)" : "#2A2A30"}} onClick={() => setShowDictModal(true)}>
-            {hasDictionary 
-              ? `${sheetUrl ? "📊" : "📗"} ${dictionary.length} SKUs` 
-              : "📕 Cargar Diccionario"
-            }
-          </button>
+          <div style={{display: "flex", gap: 6, alignItems: "center"}}>
+            {sheetUrl && (
+              <button 
+                style={{...styles.dictBtn, padding: "6px 10px", fontSize: 14, borderColor: "rgba(59,130,246,0.3)"}} 
+                onClick={() => fetchFromSheet(sheetUrl)}
+                title="Sincronizar con Google Sheet"
+              >
+                {sheetLoading ? "⏳" : "🔄"}
+              </button>
+            )}
+            <button style={{...styles.dictBtn, borderColor: sheetUrl ? "rgba(34,197,94,0.3)" : "#2A2A30"}} onClick={() => setShowDictModal(true)}>
+              {hasDictionary 
+                ? `${sheetUrl ? "📊" : "📗"} ${dictionary.length} SKUs` 
+                : "📕 Cargar Diccionario"
+              }
+            </button>
+          </div>
         </div>
         
         {/* Step indicator */}
@@ -1126,6 +1146,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                     placeholder="🔍 Buscar por SKU, nombre o código ML..."
                     value={quickSearch}
                     onChange={(e) => setQuickSearch(e.target.value)}
+                    onFocus={autoSync}
                   />
                   
                   {/* Search results dropdown */}
