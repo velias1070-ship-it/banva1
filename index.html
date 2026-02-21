@@ -345,6 +345,8 @@ function App() {
   const [showPinModal, setShowPinModal] = useState(false);
   const [pinInput, setPinInput] = useState("");
   const [pinError, setPinError] = useState(false);
+  const [productSearchIdx, setProductSearchIdx] = useState(null);
+  const [productSearchQuery, setProductSearchQuery] = useState("");
   const [labelPages, setLabelPages] = useState([]);
   const [error, setError] = useState(null);
   const [editingIdx, setEditingIdx] = useState(null);
@@ -1013,6 +1015,40 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     }
   }, [sheetUrl, sheetLoading, fetchFromSheet]);
 
+  // Inline product search results (for unmatched products)
+  const productSearchResults = React.useMemo(() => {
+    if (!productSearchQuery || productSearchQuery.length < 2 || dictionary.length === 0) return [];
+    const q = productSearchQuery.toUpperCase();
+    return dictionary.filter(d => 
+      d.sku.toUpperCase().includes(q) || 
+      (d.skuVenta || "").toUpperCase().includes(q) ||
+      (d.nombre || "").toUpperCase().includes(q) ||
+      (d.codigoML || "").toUpperCase().includes(q)
+    ).slice(0, 6);
+  }, [productSearchQuery, dictionary]);
+
+  // Assign a dictionary item to a product
+  const assignDictItem = useCallback((idx, dictItem) => {
+    setExtractedProducts(prev => {
+      const next = [...prev];
+      next[idx] = {
+        ...next[idx],
+        sku: dictItem.sku,
+        skuVenta: dictItem.skuVenta || dictItem.sku,
+        codigoML: dictItem.codigoML,
+        nombreDict: dictItem.nombre,
+        cantPack: dictItem.cantPack || 1,
+        isPack: dictItem.isPack || false,
+        matched: true,
+        matchType: "manual"
+      };
+      return next;
+    });
+    setProductSearchIdx(null);
+    setProductSearchQuery("");
+    setUnmatchedProducts(prev => prev.filter((_, i) => i !== idx));
+  }, []);
+
   // ---- Step indicator progress ----
   const stepIndex = STEPS.indexOf(step);
 
@@ -1309,7 +1345,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 <div>
                   <strong>{unmatchedProducts.length} producto(s) sin Código ML</strong>
                   <p style={{margin: "4px 0 0", fontSize: 13, color: "#F59E0B"}}>
-                    No se encontraron en el diccionario. Puedes asignar el código manualmente.
+                    Usa el buscador en cada producto para encontrarlo por nombre o SKU.
                   </p>
                 </div>
               </div>
@@ -1342,7 +1378,7 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                     </div>
                   </div>
                   
-                  {/* Dictionary name (verified) in green, AI-read name in gray below */}
+                  {/* Dictionary name (verified) in green, or search interface for unmatched */}
                   {p.nombreDict ? (
                     <div style={{marginBottom: 8}}>
                       <div style={{fontSize: 13, color: "#22C55E", fontWeight: 600}}>✓ {p.nombreDict}</div>
@@ -1355,7 +1391,45 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                     </div>
                   ) : (
                     <div style={{marginBottom: 8}}>
-                      <div style={{fontSize: 12, color: "#888"}}>{p.nombre || "Sin nombre"}</div>
+                      {p.nombre && <div style={{fontSize: 12, color: "#888", marginBottom: 6}}>Factura: {p.nombre}</div>}
+                      
+                      {/* Inline search to find the correct product */}
+                      <div style={{position: "relative"}}>
+                        <input
+                          style={{...styles.fieldInput, fontSize: 13, padding: "8px 10px", borderRadius: 8, width: "100%", border: "1px solid rgba(245,158,11,0.4)", background: "#1a1a1f"}}
+                          placeholder="🔍 Buscar producto por nombre, SKU o código ML..."
+                          value={productSearchIdx === idx ? productSearchQuery : ""}
+                          onFocus={() => { setProductSearchIdx(idx); setProductSearchQuery(""); }}
+                          onChange={(e) => { setProductSearchIdx(idx); setProductSearchQuery(e.target.value); }}
+                        />
+                        
+                        {productSearchIdx === idx && productSearchResults.length > 0 && (
+                          <div style={{
+                            position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50,
+                            background: "#1C1C20", border: "1px solid #333", borderRadius: 10,
+                            marginTop: 4, maxHeight: 220, overflow: "auto", boxShadow: "0 8px 24px rgba(0,0,0,0.5)"
+                          }}>
+                            {productSearchResults.map((d, i) => (
+                              <div 
+                                key={i}
+                                onClick={() => assignDictItem(idx, d)}
+                                style={{padding: "8px 12px", cursor: "pointer", borderBottom: "1px solid #222", transition: "background 0.15s"}}
+                                onMouseEnter={(e) => e.currentTarget.style.background = "#2A2A30"}
+                                onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                              >
+                                <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
+                                  <span style={{fontFamily: "monospace", fontWeight: 700, fontSize: 12, color: "#E8E8EC"}}>
+                                    {d.skuVenta || d.sku}
+                                    {d.isPack && <span style={{fontSize: 10, color: "#F59E0B", marginLeft: 6}}>📦x{d.cantPack}</span>}
+                                  </span>
+                                  <span style={{fontFamily: "monospace", fontSize: 11, color: "#3B82F6"}}>{d.codigoML}</span>
+                                </div>
+                                <div style={{fontSize: 11, color: "#888", marginTop: 1}}>{d.nombre || ""}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   )}
                   
