@@ -347,6 +347,8 @@ function App() {
   const [pinError, setPinError] = useState(false);
   const [productSearchIdx, setProductSearchIdx] = useState(null);
   const [productSearchQuery, setProductSearchQuery] = useState("");
+  const [pasteText, setPasteText] = useState("");
+  const [showPasteMode, setShowPasteMode] = useState(false);
   const [labelPages, setLabelPages] = useState([]);
   const [error, setError] = useState(null);
   const [editingIdx, setEditingIdx] = useState(null);
@@ -1015,6 +1017,73 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     }
   }, [sheetUrl, sheetLoading, fetchFromSheet]);
 
+  // Parse pasted Excel data and generate labels
+  // Format: Col A=SKU, B=Nombre, C=Cantidad, D=Código ML
+  const parsePasteData = React.useMemo(() => {
+    if (!pasteText || pasteText.trim().length < 3) return [];
+    const lines = pasteText.split("\n").filter(l => l.trim());
+    const items = [];
+    for (let i = 0; i < lines.length; i++) {
+      const parts = lines[i].split("\t").map(p => p.trim());
+      if (parts.length < 3) continue;
+      // Skip header
+      if (i === 0 && (parts[0].toLowerCase().includes("sku") || parts[0].toLowerCase().includes("codigo"))) continue;
+      
+      const sku = parts[0] || "";
+      const nombre = parts[1] || "";
+      const cantidad = parseInt(parts[2]) || 0;
+      const codigoML = (parts[3] || "").trim();
+      
+      if (!sku && !nombre) continue;
+      if (cantidad <= 0) continue;
+      
+      // If no codigoML provided, try to find it in dictionary
+      let finalCodigoML = codigoML;
+      let finalNombre = nombre;
+      let skuVenta = sku;
+      let matched = !!codigoML;
+      
+      if (!finalCodigoML && dictionary.length > 0) {
+        const skuUp = sku.toUpperCase();
+        const dictMatch = dictionary.find(d => d.sku.toUpperCase() === skuUp);
+        if (dictMatch) {
+          finalCodigoML = dictMatch.codigoML;
+          finalNombre = dictMatch.nombre || nombre;
+          skuVenta = dictMatch.skuVenta || sku;
+          matched = true;
+        }
+      }
+      
+      items.push({ sku, skuVenta, nombre: finalNombre, nombreDict: finalNombre, codigoML: finalCodigoML, cantidad, matched });
+    }
+    return items;
+  }, [pasteText, dictionary]);
+
+  const generateFromPaste = useCallback(async () => {
+    if (parsePasteData.length === 0) return;
+    const valid = parsePasteData.filter(p => p.codigoML);
+    if (valid.length === 0) {
+      setError("Ningún producto tiene Código ML asignado");
+      return;
+    }
+    
+    setProcessing(true);
+    setProcessingStatus("Generando etiquetas...");
+    setStep("processing");
+    
+    setExtractedProducts(valid);
+    setFolioFactura("LISTA");
+    
+    let pages = await generateLabelsPDF(valid, "LISTA");
+    if (!showCatSeparators) pages = pages.filter(p => p.type !== "separator-category");
+    if (!showProdSeparators) pages = pages.filter(p => p.type !== "separator-product");
+    setLabelPages(pages);
+    setStep("labels");
+    setProcessing(false);
+    setPasteText("");
+    setShowPasteMode(false);
+  }, [parsePasteData, showCatSeparators, showProdSeparators]);
+
   // Inline product search results (for unmatched products)
   const productSearchResults = React.useMemo(() => {
     if (!productSearchQuery || productSearchQuery.length < 2 || dictionary.length === 0) return [];
@@ -1293,6 +1362,87 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 )}
               </div>
             )}
+
+            {/* ---- Paste from Excel mode ---- */}
+            <div style={{marginTop: 16}}>
+              <div style={{display: "flex", alignItems: "center", gap: 12, marginBottom: 12}}>
+                <div style={{flex: 1, height: 1, background: "#2A2A30"}}></div>
+                <span 
+                  style={{fontSize: 12, color: showPasteMode ? "#3B82F6" : "#555", whiteSpace: "nowrap", cursor: "pointer"}}
+                  onClick={() => setShowPasteMode(!showPasteMode)}
+                >
+                  {showPasteMode ? "▾" : "▸"} pegar desde Excel
+                </span>
+                <div style={{flex: 1, height: 1, background: "#2A2A30"}}></div>
+              </div>
+
+              {showPasteMode && (
+                <div>
+                  <textarea
+                    style={{
+                      width: "100%", minHeight: 120, padding: "10px 12px", fontSize: 12,
+                      fontFamily: "monospace", background: "#0d0d10", color: "#E8E8EC",
+                      border: "1px solid #2A2A30", borderRadius: 10, resize: "vertical",
+                      lineHeight: 1.6
+                    }}
+                    placeholder={"Pega desde Excel (selecciona las celdas y Ctrl+V):\nSKU\tNombre\tCantidad\tCódigo ML\nTX2ALMPL15507\tPack Almohada Illusions\t6\tSCJN74629\nTXMTFIL1315GR\tManta Flannel Gris\t10\tUDVY31796"}
+                    value={pasteText}
+                    onChange={(e) => setPasteText(e.target.value)}
+                  />
+
+                  {parsePasteData.length > 0 && (
+                    <div style={{marginTop: 8}}>
+                      <div style={{fontSize: 12, color: "#888", marginBottom: 6}}>
+                        {parsePasteData.length} productos detectados — {parsePasteData.filter(p => p.codigoML).length} con Código ML — {parsePasteData.reduce((s, p) => s + p.cantidad, 0)} unidades
+                      </div>
+
+                      <div style={{maxHeight: 180, overflow: "auto", borderRadius: 8, border: "1px solid #2A2A30"}}>
+                        {parsePasteData.map((item, i) => (
+                          <div key={i} style={{
+                            display: "flex", alignItems: "center", gap: 8, padding: "6px 10px",
+                            borderBottom: "1px solid #1a1a1f", fontSize: 11,
+                            background: item.codigoML ? "transparent" : "rgba(245,158,11,0.05)"
+                          }}>
+                            <span style={{fontFamily: "monospace", fontWeight: 700, color: "#E8E8EC", minWidth: 110}}>{item.sku}</span>
+                            <span style={{flex: 1, color: "#888", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{item.nombre}</span>
+                            <span style={{color: "#CCC", fontWeight: 700, minWidth: 20, textAlign: "center"}}>{item.cantidad}</span>
+                            <span style={{fontFamily: "monospace", color: item.codigoML ? "#3B82F6" : "#F59E0B", minWidth: 80, textAlign: "right"}}>
+                              {item.codigoML || "Sin ML"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+
+                      {parsePasteData.some(p => !p.codigoML) && (
+                        <div style={{fontSize: 11, color: "#F59E0B", marginTop: 6}}>
+                          ⚠ {parsePasteData.filter(p => !p.codigoML).length} producto(s) sin Código ML — no se incluirán en las etiquetas
+                        </div>
+                      )}
+
+                      <button 
+                        style={{...styles.primaryBtn, background: "#22C55E", marginTop: 8}}
+                        onClick={generateFromPaste}
+                        disabled={!parsePasteData.some(p => p.codigoML)}
+                      >
+                        🏷️ Generar {parsePasteData.filter(p => p.codigoML).reduce((s, i) => s + i.cantidad, 0)} Etiquetas
+                      </button>
+
+                      {/* Separator toggles */}
+                      <div style={{display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap"}}>
+                        <label style={{display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "#888"}}>
+                          <input type="checkbox" checked={showCatSeparators} onChange={(e) => setShowCatSeparators(e.target.checked)} style={{accentColor: "#3B82F6", width: 14, height: 14}} />
+                          Sep. categoría
+                        </label>
+                        <label style={{display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "#888"}}>
+                          <input type="checkbox" checked={showProdSeparators} onChange={(e) => setShowProdSeparators(e.target.checked)} style={{accentColor: "#3B82F6", width: 14, height: 14}} />
+                          Sep. producto
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -1546,6 +1696,8 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 setFolioFactura("");
                 setQuickItems([]);
                 setQuickSearch("");
+                setPasteText("");
+                setShowPasteMode(false);
               }}>
                 📄 Nueva Factura
               </button>
