@@ -23,6 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
 <script type="text/babel">
 const { useState, useRef, useCallback, useEffect } = React;
@@ -102,6 +103,89 @@ const Code128 = (() => {
   
   return { encode, toSVG };
 })();
+
+// ============================================================
+// WMS Integration — Enviar recepción a BANVA WMS via Supabase
+// ============================================================
+const WMS_CONFIG = {
+  // CONFIGURAR: mismos valores que en el WMS (Vercel env vars)
+  SUPABASE_URL: "https://qaircihuiafgnnrwcjls.supabase.co", // ej: "https://xxxxx.supabase.co"
+  SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFhaXJjaWh1aWFmZ25ucndjamxzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNTM0MDIsImV4cCI6MjA4NzYyOTQwMn0.R3jT5azcoj1IPacCo0HJFVYlLrqbbM4PoihKQoz0FS8", // ej: "eyJhbGciOi..."
+};
+
+function getWMSClient() {
+  if (!WMS_CONFIG.SUPABASE_URL || !WMS_CONFIG.SUPABASE_ANON_KEY) return null;
+  if (!window._wmsClient) {
+    window._wmsClient = window.supabase.createClient(WMS_CONFIG.SUPABASE_URL, WMS_CONFIG.SUPABASE_ANON_KEY);
+  }
+  return window._wmsClient;
+}
+
+function isWMSConfigured() {
+  return WMS_CONFIG.SUPABASE_URL.length > 0 && WMS_CONFIG.SUPABASE_ANON_KEY.length > 0;
+}
+
+async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos) {
+  const sb = getWMSClient();
+  if (!sb) throw new Error("WMS no configurado");
+
+  // 1. Upload image to Supabase Storage
+  let imagenUrl = "";
+  if (imagenBase64) {
+    try {
+      const byteString = atob(imagenBase64.split(",")[1] || imagenBase64);
+      const ab = new ArrayBuffer(byteString.length);
+      const ia = new Uint8Array(ab);
+      for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
+      const blob = new Blob([ab], { type: "image/jpeg" });
+      const path = "facturas/" + (folio || "sin_folio") + "_" + Date.now() + ".jpg";
+      const { error: upErr } = await sb.storage.from("banva").upload(path, blob, { upsert: true });
+      if (!upErr) {
+        const { data: urlData } = sb.storage.from("banva").getPublicUrl(path);
+        imagenUrl = urlData?.publicUrl || "";
+      }
+    } catch (e) { console.error("Image upload:", e); }
+  }
+
+  // 2. Create recepcion
+  const { data: rec, error: recErr } = await sb.from("recepciones").insert({
+    folio: folio || "SIN_FOLIO",
+    proveedor: proveedor || "Desconocido",
+    imagen_url: imagenUrl,
+    estado: "CREADA",
+    notas: "",
+    created_by: "App Etiquetas",
+  }).select("id").single();
+
+  if (recErr) throw new Error("Error creando recepción: " + recErr.message);
+  const recId = rec.id;
+
+  // 3. Create líneas
+  const lineas = productos.filter(p => p.sku && p.cantidad > 0).map(p => ({
+    recepcion_id: recId,
+    sku: (p.sku || "").toUpperCase(),
+    codigo_ml: p.codigoML || "",
+    nombre: p.nombreDict || p.nombre || p.sku,
+    qty_factura: p.cantidad || 0,
+    qty_recibida: 0,
+    qty_etiquetada: 0,
+    qty_ubicada: 0,
+    estado: "PENDIENTE",
+    requiere_etiqueta: !!(p.codigoML), // Si tiene código ML, requiere etiqueta
+    costo_unitario: p.costo || 0,
+    notas: "",
+    operario_conteo: "",
+    operario_etiquetado: "",
+    operario_ubicacion: "",
+  }));
+
+  if (lineas.length > 0) {
+    const { error: linErr } = await sb.from("recepcion_lineas").insert(lineas);
+    if (linErr) throw new Error("Error creando líneas: " + linErr.message);
+  }
+
+  return { recId, lineas: lineas.length, imagenUrl };
+}
 
 // ============================================================
 // Category extractor from product name
@@ -334,7 +418,10 @@ function App() {
   const [invoiceImageBase64, setInvoiceImageBase64] = useState(null);
   const [extractedProducts, setExtractedProducts] = useState([]);
   const [folioFactura, setFolioFactura] = useState("");
+  const [proveedorFactura, setProveedorFactura] = useState("");
   const [dictionary, setDictionary] = useState([]);
+  const [wmsStatus, setWmsStatus] = useState(""); // "", "sending", "sent", "error"
+  const [wmsError, setWmsError] = useState("");
   const [hasDictionary, setHasDictionary] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [processingStatus, setProcessingStatus] = useState("");
@@ -638,6 +725,8 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
       }
       
       setFolioFactura(parsed.folio || "");
+      setProveedorFactura(parsed.proveedor || "");
+      setWmsStatus(""); setWmsError("");
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
       // Cross-reference with dictionary - EXACT match only
@@ -694,6 +783,19 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
     setStep("labels");
     setProcessing(false);
   }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators]);
+
+  // ---- Send to WMS ----
+  const sendToWMS = useCallback(async () => {
+    if (!isWMSConfigured()) { setWmsError("WMS no configurado. Editar WMS_CONFIG en index.html"); setWmsStatus("error"); return; }
+    setWmsStatus("sending"); setWmsError("");
+    try {
+      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts);
+      setWmsStatus("sent");
+    } catch (err) {
+      setWmsError(err.message);
+      setWmsStatus("error");
+    }
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts]);
 
   // ---- Download Labels PDF ----
   const downloadLabelsPDF = useCallback(async () => {
@@ -1489,6 +1591,13 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
               </div>
             </div>
 
+            {/* Proveedor */}
+            {proveedorFactura && (
+              <div style={{padding: "8px 14px", background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)", borderRadius: 8, marginBottom: 12, fontSize: 13}}>
+                <span style={{color: "#888"}}>Proveedor:</span> <strong style={{color: "#3B82F6"}}>{proveedorFactura}</strong>
+              </div>
+            )}
+
             {unmatchedProducts.length > 0 && (
               <div style={styles.warningCard}>
                 <div style={{fontSize: 24}}>⚠️</div>
@@ -1642,6 +1751,37 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 🏷️ Generar Etiquetas ({extractedProducts.filter(p => p.codigoML).reduce((s, p) => s + p.cantidad, 0)} etiquetas)
               </button>
             </div>
+
+            {/* WMS Integration */}
+            {isWMSConfigured() && (
+              <div style={{marginTop: 10}}>
+                {wmsStatus === "" && (
+                  <button 
+                    onClick={sendToWMS}
+                    style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: "linear-gradient(135deg, #10b981, #059669)", color: "#fff", fontSize: 14, fontWeight: 700, border: "none", cursor: "pointer"}}
+                  >
+                    📦 Enviar recepción al WMS
+                  </button>
+                )}
+                {wmsStatus === "sending" && (
+                  <div style={{textAlign: "center", padding: 12, color: "#F59E0B", fontSize: 13, fontWeight: 600}}>
+                    ⏳ Enviando al WMS...
+                  </div>
+                )}
+                {wmsStatus === "sent" && (
+                  <div style={{padding: "10px 14px", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 8, textAlign: "center"}}>
+                    <div style={{color: "#22C55E", fontWeight: 700, fontSize: 13}}>✅ Recepción creada en WMS</div>
+                    <div style={{color: "#888", fontSize: 11, marginTop: 2}}>El operario ya puede verla en la app de bodega</div>
+                  </div>
+                )}
+                {wmsStatus === "error" && (
+                  <div style={{padding: "10px 14px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 8}}>
+                    <div style={{color: "#EF4444", fontWeight: 700, fontSize: 12}}>❌ Error: {wmsError}</div>
+                    <button onClick={sendToWMS} style={{marginTop: 6, padding: "6px 14px", borderRadius: 6, background: "#222", color: "#EF4444", fontSize: 11, fontWeight: 600, border: "1px solid #333", cursor: "pointer"}}>Reintentar</button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -1666,6 +1806,27 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
             <button style={{...styles.secondaryBtn, width: "100%", marginTop: 10, borderColor: "rgba(139,92,246,0.4)", color: "#A78BFA"}} onClick={downloadSummary}>
               📋 Ver Hoja de Resumen
             </button>
+
+            {/* WMS status in labels step */}
+            {isWMSConfigured() && (
+              <div style={{marginTop: 10}}>
+                {wmsStatus === "sent" ? (
+                  <div style={{padding: "10px 14px", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 8, textAlign: "center"}}>
+                    <span style={{color: "#22C55E", fontWeight: 700, fontSize: 12}}>✅ Recepción enviada al WMS</span>
+                  </div>
+                ) : (
+                  <button 
+                    onClick={sendToWMS} disabled={wmsStatus === "sending"}
+                    style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: wmsStatus === "sending" ? "#333" : "linear-gradient(135deg, #10b981, #059669)", color: "#fff", fontSize: 13, fontWeight: 700, border: "none", cursor: wmsStatus === "sending" ? "default" : "pointer"}}
+                  >
+                    {wmsStatus === "sending" ? "⏳ Enviando..." : "📦 Enviar recepción al WMS"}
+                  </button>
+                )}
+                {wmsStatus === "error" && (
+                  <div style={{marginTop: 4, color: "#EF4444", fontSize: 11, textAlign: "center"}}>{wmsError}</div>
+                )}
+              </div>
+            )}
 
             {/* Preview */}
             <div style={styles.previewGrid}>
@@ -1694,6 +1855,8 @@ Responde ÚNICAMENTE con JSON válido, sin markdown ni texto extra:
                 setExtractedProducts([]);
                 setLabelPages([]);
                 setFolioFactura("");
+                setProveedorFactura("");
+                setWmsStatus(""); setWmsError("");
                 setQuickItems([]);
                 setQuickSearch("");
                 setPasteText("");
