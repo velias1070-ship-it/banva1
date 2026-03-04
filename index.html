@@ -483,20 +483,56 @@ function App() {
     }
   }, [dictionary]);
 
-  // ---- Image Upload ----
-  const handleImageUpload = useCallback((e) => {
+  // ---- Image Upload (with compression for Vision API) ----
+  const compressImage = useCallback((dataUrl, maxWidth = 2048, quality = 0.85) => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        if (w > maxWidth) { h = Math.round(h * maxWidth / w); w = maxWidth; }
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        const compressed = canvas.toDataURL("image/jpeg", quality);
+        resolve(compressed);
+      };
+      img.onerror = () => reject(new Error("No se pudo cargar la imagen"));
+      img.src = dataUrl;
+    });
+  }, []);
+
+  const handleImageUpload = useCallback(async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    
+
+    const validTypes = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+    if (!validTypes.includes(file.type) && !file.name.match(/\.(jpe?g|png|webp|heic|heif)$/i)) {
+      setError("Formato no soportado. Usa JPG, PNG o WebP.");
+      return;
+    }
+
+    if (file.size > 20 * 1024 * 1024) {
+      setError("Imagen demasiado grande (máx 20MB). Toma la foto a menor resolución.");
+      return;
+    }
+
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      setInvoiceImage(ev.target.result);
-      // Extract base64 without prefix
-      const base64 = ev.target.result.split(",")[1];
-      setInvoiceImageBase64(base64);
+    reader.onload = async (ev) => {
+      try {
+        const originalDataUrl = ev.target.result;
+        const compressed = await compressImage(originalDataUrl);
+        setInvoiceImage(compressed);
+        const base64 = compressed.split(",")[1];
+        setInvoiceImageBase64(base64);
+        setError(null);
+      } catch (err) {
+        setError("Error al procesar la imagen: " + err.message);
+      }
     };
     reader.readAsDataURL(file);
-  }, []);
+  }, [compressImage]);
 
   // ---- Dictionary Upload (CSV/TSV/XLSX) ----
   const handleDictUpload = useCallback((e) => {
@@ -561,17 +597,20 @@ function App() {
   // ---- AI Processing ----
   const processInvoice = useCallback(async () => {
     if (!invoiceImageBase64) return;
-    
+
     setProcessing(true);
-    setProcessingStatus("📷 Leyendo factura con Google Vision...");
+    setProcessingStatus("📷 Enviando imagen a Google Vision OCR...");
     setError(null);
     setStep("processing");
-    
+
     try {
       // Send image to Vision+Claude pipeline
-      const skuListStr = dictionary.length > 0 
-        ? dictionary.slice(0, 300).map(d => d.sku).join(", ") 
+      const skuListStr = dictionary.length > 0
+        ? dictionary.slice(0, 300).map(d => d.sku).join(", ")
         : "";
+
+      const imgSizeKB = Math.round(invoiceImageBase64.length * 0.75 / 1024);
+      setProcessingStatus(`📷 Enviando imagen (${imgSizeKB}KB) a Google Vision OCR...`);
 
       const response = await fetch("/api/process", {
         method: "POST",
@@ -581,11 +620,17 @@ function App() {
           skuList: skuListStr
         })
       });
-      
-      const data = await response.json();
-      
+
+      let data;
+      try {
+        data = await response.json();
+      } catch (parseErr) {
+        throw new Error("El servidor no respondió correctamente. Intenta de nuevo.");
+      }
+
       if (data.error) {
-        throw new Error(data.error);
+        const hint = data.hint ? `\n💡 ${data.hint}` : "";
+        throw new Error(data.error + hint);
       }
 
       setProcessingStatus("🤖 Estructurando datos con IA...");
