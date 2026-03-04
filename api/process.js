@@ -141,7 +141,7 @@ Responde SOLO con JSON valido, sin markdown ni explicaciones:
       headers: {
         "Content-Type": "application/json",
         "x-api-key": anthropicKey,
-        "anthropic-version": "2024-06-01"
+        "anthropic-version": "2023-06-01"
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5-20250929",
@@ -237,7 +237,7 @@ async function handler(req, res) {
         headers: {
           "Content-Type": "application/json",
           "x-api-key": anthropicKey,
-          "anthropic-version": "2024-06-01"
+          "anthropic-version": "2023-06-01"
         },
         body: claudeBody
       },
