@@ -124,6 +124,7 @@ ${skuList}
 Responde SOLO con JSON valido, sin markdown ni explicaciones:
 {
   "folio": "numero de folio/factura si es visible",
+  "proveedor": "nombre del proveedor/emisor de la factura si es visible",
   "productos": [
     {
       "sku": "codigo SKU exacto como se lee",
