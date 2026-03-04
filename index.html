@@ -503,36 +503,98 @@ function App() {
     });
   }, []);
 
+  const convertPdfToImage = useCallback(async (arrayBuffer) => {
+    const pdfjsLib = await new Promise((resolve, reject) => {
+      if (window.pdfjsLib) return resolve(window.pdfjsLib);
+      const script = document.createElement("script");
+      script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+      script.onload = () => {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        resolve(window.pdfjsLib);
+      };
+      script.onerror = () => reject(new Error("No se pudo cargar el visor de PDF"));
+      document.head.appendChild(script);
+    });
+
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const totalPages = Math.min(pdf.numPages, 5);
+    const canvases = [];
+
+    for (let i = 1; i <= totalPages; i++) {
+      const page = await pdf.getPage(i);
+      const scale = 2;
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      canvases.push(canvas);
+    }
+
+    const totalHeight = canvases.reduce((sum, c) => sum + c.height, 0);
+    const maxWidth = Math.max(...canvases.map(c => c.width));
+    const merged = document.createElement("canvas");
+    merged.width = maxWidth;
+    merged.height = totalHeight;
+    const mCtx = merged.getContext("2d");
+    let y = 0;
+    for (const c of canvases) {
+      mCtx.drawImage(c, 0, y);
+      y += c.height;
+    }
+
+    return merged.toDataURL("image/jpeg", 0.85);
+  }, []);
+
   const handleImageUpload = useCallback(async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const validTypes = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
-    if (!validTypes.includes(file.type) && !file.name.match(/\.(jpe?g|png|webp|heic|heif)$/i)) {
-      setError("Formato no soportado. Usa JPG, PNG o WebP.");
+    const isPdf = file.type === "application/pdf" || file.name.match(/\.pdf$/i);
+    const validImageTypes = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+
+    if (!isPdf && !validImageTypes.includes(file.type) && !file.name.match(/\.(jpe?g|png|webp|heic|heif)$/i)) {
+      setError("Formato no soportado. Usa JPG, PNG, WebP o PDF.");
       return;
     }
 
     if (file.size > 20 * 1024 * 1024) {
-      setError("Imagen demasiado grande (máx 20MB). Toma la foto a menor resolución.");
+      setError("Archivo demasiado grande (máx 20MB).");
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
-      try {
-        const originalDataUrl = ev.target.result;
-        const compressed = await compressImage(originalDataUrl);
-        setInvoiceImage(compressed);
-        const base64 = compressed.split(",")[1];
-        setInvoiceImageBase64(base64);
+    try {
+      if (isPdf) {
         setError(null);
-      } catch (err) {
-        setError("Error al procesar la imagen: " + err.message);
+        setProcessingStatus("Convirtiendo PDF a imagen...");
+        const arrayBuffer = await file.arrayBuffer();
+        const dataUrl = await convertPdfToImage(arrayBuffer);
+        const compressed = await compressImage(dataUrl);
+        setInvoiceImage(compressed);
+        setInvoiceImageBase64(compressed.split(",")[1]);
+        setProcessingStatus(null);
+      } else {
+        const reader = new FileReader();
+        reader.onload = async (ev) => {
+          try {
+            const originalDataUrl = ev.target.result;
+            const compressed = await compressImage(originalDataUrl);
+            setInvoiceImage(compressed);
+            setInvoiceImageBase64(compressed.split(",")[1]);
+            setError(null);
+          } catch (err) {
+            setError("Error al procesar la imagen: " + err.message);
+          }
+        };
+        reader.readAsDataURL(file);
       }
-    };
-    reader.readAsDataURL(file);
-  }, [compressImage]);
+    } catch (err) {
+      setError("Error al procesar el archivo: " + err.message);
+      setProcessingStatus(null);
+    }
+  }, [compressImage, convertPdfToImage]);
 
   // ---- Dictionary Upload (CSV/TSV/XLSX) ----
   const handleDictUpload = useCallback((e) => {
@@ -1300,25 +1362,24 @@ function App() {
                 <div style={styles.previewContainer}>
                   <img src={invoiceImage} alt="Factura" style={styles.previewImg} />
                   <div style={styles.previewOverlay}>
-                    <span style={{fontSize: 14}}>📷 Cambiar imagen</span>
+                    <span style={{fontSize: 14}}>📄 Cambiar archivo</span>
                   </div>
                 </div>
               ) : (
                 <>
-                  <div style={{fontSize: 56, marginBottom: 8}}>📸</div>
-                  <h3 style={{fontSize: 17, marginBottom: 6}}>Sube la foto de la factura</h3>
+                  <div style={{fontSize: 56, marginBottom: 8}}>📄</div>
+                  <h3 style={{fontSize: 17, marginBottom: 6}}>Sube tu factura</h3>
                   <p style={{fontSize: 13, color: "#888"}}>
-                    Toca para tomar foto o seleccionar imagen
+                    Toma foto, elige de galería o sube un PDF
                   </p>
                 </>
               )}
-              <input 
-                ref={fileInputRef} 
-                type="file" 
-                accept="image/*" 
-                capture="environment"
-                onChange={handleImageUpload} 
-                style={{display: "none"}} 
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,application/pdf"
+                onChange={handleImageUpload}
+                style={{display: "none"}}
               />
             </div>
 
