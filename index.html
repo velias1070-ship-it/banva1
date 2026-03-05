@@ -175,8 +175,13 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     qty_ubicada: 0,
     estado: "PENDIENTE",
     requiere_etiqueta: !!(p.codigoML),
+    etiqueta_impresa: p.etiquetaImpresa !== false,
+    tiene_variantes: (p.altCount || 0) > 1,
+    sku_venta: p.skuVenta || "",
     costo_unitario: p.costo || 0,
-    notas: "",
+    notas: p.etiquetaImpresa === false
+      ? "Sin etiqueta - SKU con multiples formatos de venta"
+      : (p.altCount > 1 ? "SKU con " + p.altCount + " formatos de venta" : ""),
     operario_conteo: "",
     operario_etiquetado: "",
     operario_ubicacion: "",
@@ -465,6 +470,8 @@ function App() {
   const [showCatSeparators, setShowCatSeparators] = useState(true);
   const [showProdSeparators, setShowProdSeparators] = useState(true);
   const lastSyncTime = useRef(0);
+  const [showVariantModal, setShowVariantModal] = useState(false);
+  const [variantSelections, setVariantSelections] = useState([]); // [{productIdx, sku, matches: [...dictItems], selected: null}]
   
   // Parse CSV text into dictionary array
   // Format: Col A=SKU Venta, B=Código ML, C=Nombre, D=?, E=SKU Proveedor, F=Cant Pack
@@ -819,10 +826,32 @@ function App() {
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
       // Cross-reference with dictionary - EXACT match only
-      const enriched = (parsed.productos || []).map(p => {
+      const pendingVariants = [];
+      const enriched = (parsed.productos || []).map((p, idx) => {
         const skuUp = (p.sku || "").toUpperCase().trim();
         // Find ALL matches (same SKU proveedor can have multiple products: pack vs individual)
         const matches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+
+        if (matches.length > 1) {
+          // Multiple publications for same origin SKU — needs user selection
+          pendingVariants.push({ productIdx: idx, sku: skuUp, matches, selected: null });
+          return {
+            ...p,
+            costo: p.costo_unitario || 0,
+            codigoML: "",
+            nombreDict: "",
+            skuVenta: "",
+            cantPack: 1,
+            isPack: false,
+            matched: false,
+            matchType: "",
+            altCount: matches.length,
+            needsVariantSelection: true,
+            etiquetaImpresa: true,
+            skuOriginal: ""
+          };
+        }
+
         const match = matches[0] || null;
         return {
           ...p,
@@ -834,14 +863,23 @@ function App() {
           isPack: match?.isPack || false,
           matched: !!match,
           matchType: match ? "exacto" : "",
-          altCount: matches.length > 1 ? matches.length : 0,
+          altCount: 0,
+          needsVariantSelection: false,
+          etiquetaImpresa: true,
           skuOriginal: ""
         };
       });
-      
-      const unmatched = enriched.filter(p => !p.matched);
+
+      const unmatched = enriched.filter(p => !p.matched && !p.needsVariantSelection);
       setUnmatchedProducts(unmatched);
       setExtractedProducts(enriched);
+
+      // If there are products with multiple variants, show selection modal
+      if (pendingVariants.length > 0) {
+        setVariantSelections(pendingVariants);
+        setShowVariantModal(true);
+      }
+
       setStep("review");
       
     } catch (err) {
@@ -1102,23 +1140,44 @@ function App() {
       
       // If SKU is being edited, try to lookup in dictionary
       if (field === "sku") {
-        const result = lookupSku(value);
-        if (result) {
-          updated.codigoML = result.codigoML;
-          updated.nombreDict = result.nombre;
-          updated.skuVenta = result.skuVenta || "";
-          updated.cantPack = result.cantPack || 1;
-          updated.isPack = result.isPack || false;
-          updated.matched = true;
-          updated.matchType = result.matchType;
-          updated.skuOriginal = result.sku !== value.toUpperCase() ? result.sku : "";
-        } else {
+        const skuUp = (value || "").toUpperCase().trim();
+        const allMatches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+
+        if (allMatches.length > 1) {
+          // Multiple variants — trigger selection modal
           updated.codigoML = "";
           updated.nombreDict = "";
           updated.skuVenta = "";
           updated.matched = false;
-          updated.matchType = "";
-          updated.skuOriginal = "";
+          updated.needsVariantSelection = true;
+          updated.altCount = allMatches.length;
+          updated.etiquetaImpresa = true;
+          // Open variant modal for this product
+          setTimeout(() => {
+            setVariantSelections([{ productIdx: idx, sku: skuUp, matches: allMatches, selected: null }]);
+            setShowVariantModal(true);
+          }, 0);
+        } else {
+          const result = lookupSku(value);
+          if (result) {
+            updated.codigoML = result.codigoML;
+            updated.nombreDict = result.nombre;
+            updated.skuVenta = result.skuVenta || "";
+            updated.cantPack = result.cantPack || 1;
+            updated.isPack = result.isPack || false;
+            updated.matched = true;
+            updated.matchType = result.matchType;
+            updated.needsVariantSelection = false;
+            updated.skuOriginal = result.sku !== value.toUpperCase() ? result.sku : "";
+          } else {
+            updated.codigoML = "";
+            updated.nombreDict = "";
+            updated.skuVenta = "";
+            updated.matched = false;
+            updated.matchType = "";
+            updated.needsVariantSelection = false;
+            updated.skuOriginal = "";
+          }
         }
       }
       
@@ -1310,6 +1369,48 @@ function App() {
     setProductSearchQuery("");
     setUnmatchedProducts(prev => prev.filter((_, i) => i !== idx));
   }, []);
+
+  // ---- Variant Selection: apply user choices for duplicate origin SKUs ----
+  const applyVariantSelections = useCallback(() => {
+    setExtractedProducts(prev => {
+      const next = [...prev];
+      for (const vs of variantSelections) {
+        const idx = vs.productIdx;
+        if (vs.selected === "no_label") {
+          // User chose not to label this product
+          next[idx] = {
+            ...next[idx],
+            codigoML: "",
+            nombreDict: vs.matches[0]?.nombre || next[idx].nombre || "",
+            skuVenta: vs.matches[0]?.skuVenta || "",
+            matched: true,
+            matchType: "sin_etiqueta",
+            needsVariantSelection: false,
+            etiquetaImpresa: false,
+            altCount: vs.matches.length,
+          };
+        } else if (vs.selected !== null) {
+          // User chose a specific variant
+          const chosen = vs.matches[vs.selected];
+          next[idx] = {
+            ...next[idx],
+            codigoML: chosen.codigoML,
+            nombreDict: chosen.nombre,
+            skuVenta: chosen.skuVenta || chosen.sku,
+            cantPack: chosen.cantPack || 1,
+            isPack: chosen.isPack || false,
+            matched: true,
+            matchType: "variante_elegida",
+            needsVariantSelection: false,
+            etiquetaImpresa: true,
+            altCount: vs.matches.length,
+          };
+        }
+      }
+      return next;
+    });
+    setShowVariantModal(false);
+  }, [variantSelections]);
 
   // ---- Step indicator progress ----
   // ---- Barcode Scanner for Verify Mode ----
@@ -1777,7 +1878,7 @@ function App() {
                   key={idx} 
                   style={{
                     ...styles.productCard,
-                    borderColor: !p.codigoML ? "rgba(245,158,11,0.4)" : p.confianza === "baja" ? "rgba(239,68,68,0.4)" : "rgba(34,197,94,0.2)"
+                    borderColor: p.needsVariantSelection ? "rgba(139,92,246,0.5)" : p.etiquetaImpresa === false ? "rgba(245,158,11,0.4)" : !p.codigoML ? "rgba(245,158,11,0.4)" : p.confianza === "baja" ? "rgba(239,68,68,0.4)" : "rgba(34,197,94,0.2)"
                   }}
                 >
                   <div style={styles.productHeader}>
@@ -1787,18 +1888,36 @@ function App() {
                       onChange={(e) => updateProduct(idx, "sku", e.target.value.toUpperCase())}
                       placeholder="Tipear SKU..."
                     />
-                    <div style={{display: "flex", gap: 6, alignItems: "center"}}>
+                    <div style={{display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap"}}>
                       {p.confianza === "baja" && <span style={styles.badgeDanger}>⚠ Baja conf.</span>}
-                      {!p.matched && <span style={styles.badgeWarning}>Sin ML</span>}
-                      {p.matched && <span style={styles.badgeSuccess}>✓ ML</span>}
+                      {p.etiquetaImpresa === false && <span style={{...styles.badgeWarning, background: "rgba(245,158,11,0.15)", color: "#F59E0B"}}>🚫 Sin etiqueta</span>}
+                      {p.needsVariantSelection && <span style={{...styles.badgeWarning, background: "rgba(239,68,68,0.15)", color: "#EF4444", cursor: "pointer"}} onClick={() => setShowVariantModal(true)}>⚠ Elegir formato</span>}
+                      {!p.matched && !p.needsVariantSelection && <span style={styles.badgeWarning}>Sin ML</span>}
+                      {p.matched && p.etiquetaImpresa !== false && <span style={styles.badgeSuccess}>✓ ML</span>}
                       {p.isPack && <span style={{...styles.badgeSuccess, background: "rgba(245,158,11,0.12)", color: "#F59E0B"}}>📦 Pack x{p.cantPack}</span>}
-                      {p.altCount > 1 && <span style={{...styles.badgeSuccess, background: "rgba(139,92,246,0.12)", color: "#8B5CF6"}}>⚠ {p.altCount} variantes</span>}
+                      {p.altCount > 1 && !p.needsVariantSelection && <span style={{...styles.badgeSuccess, background: "rgba(139,92,246,0.12)", color: "#8B5CF6", cursor: "pointer"}} onClick={() => {
+                        const skuUp = (p.sku || "").toUpperCase().trim();
+                        const matches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+                        if (matches.length > 1) {
+                          setVariantSelections([{ productIdx: idx, sku: skuUp, matches, selected: null }]);
+                          setShowVariantModal(true);
+                        }
+                      }}>{p.altCount} variantes</span>}
                       <button style={styles.removeBtn} onClick={() => removeProduct(idx)}>✕</button>
                     </div>
                   </div>
                   
                   {/* Dictionary name (verified) in green, or search interface for unmatched */}
-                  {p.nombreDict ? (
+                  {p.etiquetaImpresa === false && p.matched ? (
+                    <div style={{marginBottom: 8}}>
+                      <div style={{fontSize: 13, color: "#F59E0B", fontWeight: 600}}>🚫 Sin etiqueta — se etiquetará después</div>
+                      {p.nombreDict && <div style={{fontSize: 12, color: "#888", marginTop: 2}}>{p.nombreDict}</div>}
+                      {p.nombre && p.nombre !== p.nombreDict && (
+                        <div style={{fontSize: 11, color: "#555", marginTop: 2}}>Factura: {p.nombre}</div>
+                      )}
+                      <div style={{fontSize: 11, color: "#8B5CF6", marginTop: 2}}>{p.altCount} formatos de venta disponibles</div>
+                    </div>
+                  ) : p.nombreDict ? (
                     <div style={{marginBottom: 8}}>
                       <div style={{fontSize: 13, color: "#22C55E", fontWeight: 600}}>✓ {p.nombreDict}</div>
                       {p.nombre && p.nombre !== p.nombreDict && (
@@ -2198,6 +2317,108 @@ function App() {
                 Desbloquear
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ====================== VARIANT SELECTION MODAL ====================== */}
+      {showVariantModal && variantSelections.length > 0 && (
+        <div style={styles.modalOverlay} onClick={() => {}}>
+          <div style={{...styles.modalContent, maxWidth: 520}} onClick={(e) => e.stopPropagation()}>
+            <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16}}>
+              <h3 style={{margin: 0, fontSize: 17}}>Seleccionar formato de venta</h3>
+            </div>
+            <p style={{color: "#999", fontSize: 13, marginBottom: 16}}>
+              Estos productos tienen el mismo SKU de origen pero distintas publicaciones.
+              Elige qué código ML asignar a cada uno, o selecciona "No etiquetar" si prefieres etiquetarlos después.
+            </p>
+
+            {variantSelections.map((vs, vsIdx) => (
+              <div key={vsIdx} style={{marginBottom: 20, padding: 14, background: "#141416", borderRadius: 10, border: "1px solid #2A2A30"}}>
+                <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10}}>
+                  <div>
+                    <span style={{fontFamily: "monospace", fontWeight: 700, color: "#E8E8EC", fontSize: 14}}>{vs.sku}</span>
+                    <span style={{fontSize: 12, color: "#8B5CF6", marginLeft: 8}}>{vs.matches.length} publicaciones</span>
+                  </div>
+                  <span style={{fontSize: 12, color: "#888"}}>
+                    Cant: {extractedProducts[vs.productIdx]?.cantidad || 0}
+                  </span>
+                </div>
+
+                {vs.matches.map((m, mIdx) => (
+                  <div
+                    key={mIdx}
+                    onClick={() => {
+                      setVariantSelections(prev => {
+                        const next = [...prev];
+                        next[vsIdx] = { ...next[vsIdx], selected: mIdx };
+                        return next;
+                      });
+                    }}
+                    style={{
+                      padding: "10px 12px", marginBottom: 6, borderRadius: 8, cursor: "pointer",
+                      border: vs.selected === mIdx ? "2px solid #3B82F6" : "1px solid #333",
+                      background: vs.selected === mIdx ? "rgba(59,130,246,0.1)" : "#1C1C20",
+                      transition: "all 0.15s"
+                    }}
+                  >
+                    <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
+                      <div>
+                        <span style={{fontFamily: "monospace", fontWeight: 700, fontSize: 13, color: "#E8E8EC"}}>{m.skuVenta}</span>
+                        {m.isPack && <span style={{fontSize: 11, color: "#F59E0B", marginLeft: 8}}>Pack x{m.cantPack}</span>}
+                        {!m.isPack && <span style={{fontSize: 11, color: "#22C55E", marginLeft: 8}}>Unidad x{m.cantPack}</span>}
+                      </div>
+                      <span style={{fontFamily: "monospace", fontSize: 12, color: "#3B82F6", fontWeight: 600}}>{m.codigoML}</span>
+                    </div>
+                    <div style={{fontSize: 11, color: "#888", marginTop: 3}}>{m.nombre}</div>
+                  </div>
+                ))}
+
+                {/* No label option */}
+                <div
+                  onClick={() => {
+                    setVariantSelections(prev => {
+                      const next = [...prev];
+                      next[vsIdx] = { ...next[vsIdx], selected: "no_label" };
+                      return next;
+                    });
+                  }}
+                  style={{
+                    padding: "10px 12px", borderRadius: 8, cursor: "pointer",
+                    border: vs.selected === "no_label" ? "2px solid #F59E0B" : "1px solid #333",
+                    background: vs.selected === "no_label" ? "rgba(245,158,11,0.1)" : "#1C1C20",
+                    transition: "all 0.15s"
+                  }}
+                >
+                  <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                    <span style={{fontSize: 16}}>🚫</span>
+                    <span style={{fontSize: 13, color: vs.selected === "no_label" ? "#F59E0B" : "#888", fontWeight: 600}}>
+                      No etiquetar ahora
+                    </span>
+                  </div>
+                  <div style={{fontSize: 11, color: "#666", marginTop: 2, marginLeft: 24}}>
+                    Se recibirá sin etiqueta. Podrás etiquetarlo después según formato de venta.
+                  </div>
+                </div>
+              </div>
+            ))}
+
+            <button
+              onClick={applyVariantSelections}
+              disabled={variantSelections.some(vs => vs.selected === null)}
+              style={{
+                width: "100%", padding: "14px", borderRadius: 10, fontSize: 15, fontWeight: 700, border: "none", cursor: "pointer",
+                background: variantSelections.some(vs => vs.selected === null)
+                  ? "#333" : "linear-gradient(135deg, #3B82F6, #2563EB)",
+                color: variantSelections.some(vs => vs.selected === null) ? "#666" : "#fff",
+                marginTop: 4
+              }}
+            >
+              {variantSelections.some(vs => vs.selected === null)
+                ? `Selecciona formato para ${variantSelections.filter(vs => vs.selected === null).length} producto(s)`
+                : "Confirmar selección"
+              }
+            </button>
           </div>
         </div>
       )}
