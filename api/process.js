@@ -115,8 +115,10 @@ REGLAS IMPORTANTES:
 - El SKU es un codigo alfanumerico como "TXV23QLAT30BE" o "JSAFAB421P20S"
 - La cantidad puede aparecer como "Cant", "Qty", numero entero
 - El nombre del producto suele estar junto al SKU
+- El costo unitario neto (sin IVA) de cada producto suele aparecer como "P. Unitario", "Precio Unit", "Valor Unit" o similar
 - NO inventes productos. Si no puedes leer algo con certeza, omitelo
 - Si un campo es ilegible, dejalo vacio
+- Los montos totales de la factura suelen aparecer al final: Neto, IVA (19%), Total
 
 SKUs validos del diccionario (REFERENCIA, usa SOLO si coinciden exactamente con lo que lees):
 ${skuList}
@@ -125,11 +127,15 @@ Responde SOLO con JSON valido, sin markdown ni explicaciones:
 {
   "folio": "numero de folio/factura si es visible",
   "proveedor": "nombre del proveedor/emisor de la factura si es visible",
+  "costo_neto": numero o 0,
+  "iva": numero o 0,
+  "costo_bruto": numero o 0,
   "productos": [
     {
       "sku": "codigo SKU exacto como se lee",
       "nombre": "nombre del producto",
       "cantidad": numero,
+      "costo_unitario": numero o 0,
       "confianza": "alta" o "baja"
     }
   ]

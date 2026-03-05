@@ -125,7 +125,7 @@ function isWMSConfigured() {
   return WMS_CONFIG.SUPABASE_URL.length > 0 && WMS_CONFIG.SUPABASE_ANON_KEY.length > 0;
 }
 
-async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos) {
+async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos) {
   const sb = getWMSClient();
   if (!sb) throw new Error("WMS no configurado");
 
@@ -153,6 +153,9 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos) {
     proveedor: proveedor || "Desconocido",
     imagen_url: imagenUrl,
     estado: "CREADA",
+    costo_neto: costos?.costo_neto || 0,
+    iva: costos?.iva || 0,
+    costo_bruto: costos?.costo_bruto || 0,
     notas: "",
     created_by: "App Etiquetas",
   }).select("id").single();
@@ -421,6 +424,9 @@ function App() {
   const [proveedorFactura, setProveedorFactura] = useState("");
   const [wmsStatus, setWmsStatus] = useState(""); // "", "sending", "sent", "error"
   const [wmsError, setWmsError] = useState("");
+  const [costoNeto, setCostoNeto] = useState(0);
+  const [iva, setIva] = useState(0);
+  const [costoBruto, setCostoBruto] = useState(0);
   const [dictionary, setDictionary] = useState([]);
   const [hasDictionary, setHasDictionary] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -806,6 +812,9 @@ function App() {
       
       setFolioFactura(parsed.folio || "");
       setProveedorFactura(parsed.proveedor || "");
+      setCostoNeto(parsed.costo_neto || 0);
+      setIva(parsed.iva || 0);
+      setCostoBruto(parsed.costo_bruto || 0);
       setWmsStatus(""); setWmsError("");
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
@@ -817,6 +826,7 @@ function App() {
         const match = matches[0] || null;
         return {
           ...p,
+          costo: p.costo_unitario || 0,
           codigoML: match?.codigoML || "",
           nombreDict: match?.nombre || "",
           skuVenta: match?.skuVenta || "",
@@ -869,13 +879,14 @@ function App() {
     if (!isWMSConfigured()) { setWmsError("WMS no configurado. Editar WMS_CONFIG en index.html"); setWmsStatus("error"); return; }
     setWmsStatus("sending"); setWmsError("");
     try {
-      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts);
+      const costos = { costo_neto: costoNeto, iva, costo_bruto: costoBruto };
+      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos);
       setWmsStatus("sent");
     } catch (err) {
       setWmsError(err.message);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto]);
 
   // ---- Download Labels PDF ----
   const downloadLabelsPDF = useCallback(async () => {
@@ -2006,6 +2017,7 @@ function App() {
                 setFolioFactura("");
                 setProveedorFactura("");
                 setWmsStatus(""); setWmsError("");
+                setCostoNeto(0); setIva(0); setCostoBruto(0);
                 setQuickItems([]);
                 setQuickSearch("");
                 setPasteText("");
