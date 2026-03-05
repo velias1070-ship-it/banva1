@@ -164,28 +164,63 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
   const recId = rec.id;
 
   // 3. Create líneas
-  const lineas = productos.filter(p => p.sku && p.cantidad > 0).map(p => ({
-    recepcion_id: recId,
-    sku: (p.sku || "").toUpperCase(),
-    codigo_ml: p.codigoML || "",
-    nombre: p.nombreDict || p.nombre || p.sku,
-    qty_factura: p.cantidad || 0,
-    qty_recibida: 0,
-    qty_etiquetada: 0,
-    qty_ubicada: 0,
-    estado: "PENDIENTE",
-    requiere_etiqueta: !!(p.codigoML),
-    etiqueta_impresa: p.etiquetaImpresa !== false,
-    tiene_variantes: (p.altCount || 0) > 1,
-    sku_venta: p.skuVenta || "",
-    costo_unitario: p.costo || 0,
-    notas: p.etiquetaImpresa === false
-      ? "Sin etiqueta - SKU con multiples formatos de venta"
-      : (p.altCount > 1 ? "SKU con " + p.altCount + " formatos de venta" : ""),
-    operario_conteo: "",
-    operario_etiquetado: "",
-    operario_ubicacion: "",
-  }));
+  const lineas = productos.filter(p => p.sku && p.cantidad > 0).map(p => {
+    // Determine label type description for WMS
+    let tipoEtiqueta = "sin_etiqueta";
+    let descripcionEtiqueta = "Sin etiqueta";
+    if (p.etiquetaImpresa !== false && p.codigoML) {
+      if (p.isPack) {
+        tipoEtiqueta = "pack_x" + (p.cantPack || 1);
+        descripcionEtiqueta = "Etiqueta PACK x" + (p.cantPack || 1) + " — " + (p.nombreDict || p.nombre);
+      } else {
+        tipoEtiqueta = "individual";
+        descripcionEtiqueta = "Etiqueta individual — " + (p.nombreDict || p.nombre);
+      }
+    } else if (p.etiquetaImpresa === false) {
+      tipoEtiqueta = "no_etiquetado";
+      descripcionEtiqueta = "Decisión: NO etiquetar (producto sin etiqueta física en bodega)";
+    }
+
+    // Build notas with full context for admin
+    let notas = "";
+    if (p.etiquetaImpresa === false) {
+      notas = "⚠ SIN ETIQUETA — Este producto está en bodega SIN etiqueta. ";
+      notas += "Razón: SKU " + (p.sku || "").toUpperCase() + " tiene " + (p.altCount || "múltiples") + " publicaciones ML distintas y se eligió no etiquetar.";
+    } else if ((p.altCount || 0) > 1 && p.codigoML) {
+      notas = "✓ Etiquetado como: " + (p.nombreDict || p.nombre) + " [" + p.codigoML + "]. ";
+      notas += "OJO: Este SKU tiene " + p.altCount + " publicaciones ML distintas. Se eligió esta variante.";
+      if (p.isPack) notas += " (PACK x" + (p.cantPack || 1) + ")";
+    } else if (p.codigoML) {
+      notas = "Etiquetado: " + (p.nombreDict || p.nombre) + " [" + p.codigoML + "]";
+    }
+
+    return {
+      recepcion_id: recId,
+      sku: (p.sku || "").toUpperCase(),
+      codigo_ml: p.codigoML || "",
+      nombre: p.nombreDict || p.nombre || p.sku,
+      qty_factura: p.cantidad || 0,
+      qty_recibida: 0,
+      qty_etiquetada: 0,
+      qty_ubicada: 0,
+      estado: "PENDIENTE",
+      requiere_etiqueta: !!(p.codigoML),
+      etiqueta_impresa: p.etiquetaImpresa !== false,
+      tiene_variantes: (p.altCount || 0) > 1,
+      tipo_etiqueta: tipoEtiqueta,
+      descripcion_etiqueta: descripcionEtiqueta,
+      nombre_publicacion_ml: p.codigoML ? (p.nombreDict || p.nombre || "") : "",
+      cant_variantes: (p.altCount || 0) > 1 ? p.altCount : 0,
+      es_pack: !!(p.isPack),
+      cant_pack: p.cantPack || 1,
+      sku_venta: p.skuVenta || "",
+      costo_unitario: p.costo || 0,
+      notas: notas,
+      operario_conteo: "",
+      operario_etiquetado: "",
+      operario_ubicacion: "",
+    };
+  });
 
   if (lineas.length > 0) {
     const { error: linErr } = await sb.from("recepcion_lineas").insert(lineas);
