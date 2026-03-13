@@ -108,67 +108,68 @@ async function ocrWithVision(imageBase64, apiKey, retries = 2) {
 }
 
 async function structureWithClaude(ocrText, skuList, anthropicKey) {
-  const systemPrompt = `Eres un sistema de extraccion de datos de facturas. Recibes el texto OCR de una factura y debes extraer los productos listados.
+  // Truncate OCR text to avoid exceeding token limits
+  const truncatedOcr = ocrText.length > 6000 ? ocrText.slice(0, 6000) : ocrText;
 
-REGLAS IMPORTANTES:
-- Extrae SOLO los productos que aparecen como items de la factura (lineas con SKU, nombre, cantidad)
-- El SKU es un codigo alfanumerico como "TXV23QLAT30BE" o "JSAFAB421P20S"
-- La cantidad puede aparecer como "Cant", "Qty", numero entero
-- El nombre del producto suele estar junto al SKU
-- El costo unitario neto (sin IVA) de cada producto suele aparecer como "P. Unitario", "Precio Unit", "Valor Unit" o similar
-- NO inventes productos. Si no puedes leer algo con certeza, omitelo
-- Si un campo es ilegible, dejalo vacio
-- Los montos totales de la factura suelen aparecer al final: Neto, IVA (19%), Total
+  const systemPrompt = `Eres un sistema de extraccion de datos de facturas. Recibes texto OCR de una factura y extraes los productos.
 
-SKUs validos del diccionario (REFERENCIA, usa SOLO si coinciden exactamente con lo que lees):
-${skuList}
+REGLAS:
+- Extrae SOLO productos de la factura (lineas con SKU, nombre, cantidad)
+- SKU: codigo alfanumerico como "TXV23QLAT30BE"
+- Cantidad: "Cant", "Qty", numero entero
+- Costo unitario neto (sin IVA): "P. Unitario", "Precio Unit", "Valor Unit"
+- NO inventes productos. Si algo es ilegible, omitelo
+- Montos totales al final: Neto, IVA (19%), Total
+${skuList ? "\nSKUs de referencia (usa SOLO si coinciden con lo que lees):\n" + skuList : ""}
 
-Responde SOLO con JSON valido, sin markdown ni explicaciones:
-{
-  "folio": "numero de folio/factura si es visible",
-  "proveedor": "nombre del proveedor/emisor de la factura si es visible",
-  "costo_neto": numero o 0,
-  "iva": numero o 0,
-  "costo_bruto": numero o 0,
-  "productos": [
-    {
-      "sku": "codigo SKU exacto como se lee",
-      "nombre": "nombre del producto",
-      "cantidad": numero,
-      "costo_unitario": numero o 0,
-      "confianza": "alta" o "baja"
+Responde SOLO JSON valido:
+{"folio":"","proveedor":"","costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta|baja"}]}`;
+
+  const requestBody = JSON.stringify({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 4000,
+    system: systemPrompt,
+    messages: [{
+      role: "user",
+      content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
+    }]
+  });
+
+  // Retry with exponential backoff for rate limits (429)
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
     }
-  ]
-}`;
 
-  const response = await fetchWithTimeout(
-    "https://api.anthropic.com/v1/messages",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01"
+    const response = await fetchWithTimeout(
+      "https://api.anthropic.com/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01"
+        },
+        body: requestBody
       },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-5-20250929",
-        max_tokens: 4000,
-        system: systemPrompt,
-        messages: [{
-          role: "user",
-          content: "Aqui esta el texto OCR extraido de una factura. Extrae todos los productos:\n\n---\n" + ocrText + "\n---"
-        }]
-      })
-    },
-    30000
-  );
+      30000
+    );
 
-  if (!response.ok) {
+    if (response.ok) {
+      return response.json();
+    }
+
     const err = await response.text();
-    throw new Error("Claude API error: " + response.status + " - " + err);
+    lastError = "Claude API error: " + response.status + " - " + err;
+
+    // Only retry on 429 (rate limit) or 529 (overloaded)
+    if (response.status !== 429 && response.status !== 529) {
+      throw new Error(lastError);
+    }
   }
 
-  return response.json();
+  throw new Error(lastError);
 }
 
 async function handler(req, res) {

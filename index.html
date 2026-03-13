@@ -767,7 +767,7 @@ function App() {
     try {
       // Send image to Vision+Claude pipeline
       const skuListStr = dictionary.length > 0
-        ? dictionary.slice(0, 300).map(d => d.sku).join(", ")
+        ? dictionary.slice(0, 100).map(d => d.sku).join(", ")
         : "";
 
       const imgSizeKB = Math.round(invoiceImageBase64.length * 0.75 / 1024);
