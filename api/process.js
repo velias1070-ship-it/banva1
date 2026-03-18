@@ -126,7 +126,7 @@ Responde SOLO JSON valido:
 {"folio":"","proveedor":"","costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta|baja"}]}`;
 
   const requestBody = JSON.stringify({
-    model: "claude-haiku-4-5-20251001",
+    model: "claude-sonnet-4-5-20250929",
     max_tokens: 4000,
     system: systemPrompt,
     messages: [{
