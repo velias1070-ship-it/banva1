@@ -952,7 +952,14 @@ function App() {
         doc.addImage(labelPages[i].data, "PNG", 0, 0, 60, 40);
       }
       
-      const filename = `etiquetas_${folioFactura || "banva"}_${new Date().toISOString().slice(0,10)}.pdf`;
+      const validProds = extractedProducts.filter(p => p.codigoML && p.cantidad > 0);
+      let filename;
+      if (folioFactura === "RAPIDO" && validProds.length === 1) {
+        const prodName = (validProds[0].nombreDict || validProds[0].nombre || validProds[0].sku || "etiqueta").replace(/[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑ _-]/g, "").trim();
+        filename = `${prodName}.pdf`;
+      } else {
+        filename = `etiquetas_${folioFactura || "banva"}_${new Date().toISOString().slice(0,10)}.pdf`;
+      }
       doc.save(filename);
     } catch(err) {
       // Fallback: open in new window for print-to-PDF
