@@ -1,13 +1,7 @@
+const crypto = require("crypto");
+
 const config = {
   maxDuration: 60,
-};
-
-const VISION_ERRORS = {
-  400: "Imagen no válida o corrupta. Intenta tomar la foto de nuevo.",
-  401: "Error de autenticación con Google Vision. Verifica GOOGLE_VISION_API_KEY.",
-  403: "Google Vision API no habilitada o clave sin permisos. Verifica que Cloud Vision API esté habilitada en tu proyecto de Google Cloud.",
-  429: "Demasiadas solicitudes a Google Vision. Espera un momento e intenta de nuevo.",
-  413: "Imagen demasiado grande para Google Vision (máx ~10MB en base64).",
 };
 
 async function fetchWithTimeout(url, options, timeoutMs = 30000) {
@@ -26,151 +20,208 @@ async function fetchWithTimeout(url, options, timeoutMs = 30000) {
   }
 }
 
-async function ocrWithVision(imageBase64, apiKey, retries = 2) {
-  const payload = JSON.stringify({
-    requests: [{
-      image: { content: imageBase64 },
-      features: [
-        { type: "DOCUMENT_TEXT_DETECTION" },
-        { type: "TEXT_DETECTION" }
-      ],
-      imageContext: {
-        languageHints: ["es", "en"]
-      }
-    }]
-  });
+// --- Google Auth: generate access token from service account JSON ---
 
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const response = await fetchWithTimeout(
-        `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: payload
-        },
-        35000
-      );
+function createJwt(serviceAccount) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: serviceAccount.client_email,
+    scope: "https://www.googleapis.com/auth/cloud-platform",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
 
-      if (!response.ok) {
-        const errBody = await response.text();
-        const friendlyMsg = VISION_ERRORS[response.status];
-        if (friendlyMsg) throw new Error(friendlyMsg);
+  const encode = (obj) =>
+    Buffer.from(JSON.stringify(obj)).toString("base64url");
 
-        let detail = "";
-        try {
-          const errJson = JSON.parse(errBody);
-          detail = errJson.error?.message || errBody.slice(0, 200);
-        } catch { detail = errBody.slice(0, 200); }
-        throw new Error(`Vision API error (${response.status}): ${detail}`);
-      }
+  const unsigned = encode(header) + "." + encode(payload);
+  const sign = crypto.createSign("RSA-SHA256");
+  sign.update(unsigned);
+  const signature = sign.sign(serviceAccount.private_key, "base64url");
 
-      const data = await response.json();
-
-      // Check for per-image errors
-      const imgResponse = data.responses?.[0];
-      if (imgResponse?.error) {
-        throw new Error(`Vision API: ${imgResponse.error.message || "Error procesando imagen"}`);
-      }
-
-      // Try fullTextAnnotation first (better for documents), fallback to textAnnotations
-      const fullText = imgResponse?.fullTextAnnotation?.text;
-      const simpleText = imgResponse?.textAnnotations?.[0]?.description;
-      const ocrText = fullText || simpleText;
-
-      if (!ocrText || ocrText.trim().length < 5) {
-        throw new Error(
-          "No se detectó texto en la imagen. Asegúrate de que:\n" +
-          "- La factura esté bien iluminada\n" +
-          "- El texto sea legible y no esté borroso\n" +
-          "- La imagen no esté al revés o rotada"
-        );
-      }
-
-      return ocrText;
-
-    } catch (err) {
-      lastError = err;
-      // Only retry on network/timeout errors, not on API validation errors
-      const isRetryable = err.message.includes("timeout") ||
-                          err.message.includes("fetch failed") ||
-                          err.message.includes("ECONNRESET") ||
-                          err.message.includes("429");
-      if (attempt < retries && isRetryable) {
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw lastError;
+  return unsigned + "." + signature;
 }
 
-async function structureWithClaude(ocrText, skuList, anthropicKey) {
-  // Truncate OCR text to avoid exceeding token limits
-  const truncatedOcr = ocrText.length > 6000 ? ocrText.slice(0, 6000) : ocrText;
+async function getAccessToken(serviceAccount) {
+  const jwt = createJwt(serviceAccount);
 
-  const systemPrompt = `Eres un sistema de extraccion de datos de facturas. Recibes texto OCR de una factura y extraes los productos.
+  const response = await fetchWithTimeout(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+    },
+    10000
+  );
 
-REGLAS:
-- Extrae SOLO productos de la factura (lineas con SKU, nombre, cantidad)
-- SKU: codigo alfanumerico como "TXV23QLAT30BE"
-- Cantidad: "Cant", "Qty", numero entero
-- Costo unitario neto (sin IVA): "P. Unitario", "Precio Unit", "Valor Unit"
-- NO inventes productos. Si algo es ilegible, omitelo
-- Montos totales al final: Neto, IVA (19%), Total
-${skuList ? "\nSKUs de referencia (usa SOLO si coinciden con lo que lees):\n" + skuList : ""}
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Error de autenticación Google: ${response.status} - ${err}`);
+  }
 
-Responde SOLO JSON valido:
-{"folio":"","proveedor":"","costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta|baja"}]}`;
+  const data = await response.json();
+  return data.access_token;
+}
+
+// --- Document AI Invoice Parser ---
+
+async function parseInvoiceWithDocumentAI(imageBase64, serviceAccount, processorId, location) {
+  const accessToken = await getAccessToken(serviceAccount);
+  const projectId = serviceAccount.project_id;
+  const loc = location || "us";
+
+  const endpoint = `https://${loc}-documentai.googleapis.com/v1/projects/${projectId}/locations/${loc}/processors/${processorId}:process`;
 
   const requestBody = JSON.stringify({
-    model: "claude-sonnet-4-5-20250929",
-    max_tokens: 4000,
-    system: systemPrompt,
-    messages: [{
-      role: "user",
-      content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
-    }]
+    rawDocument: {
+      content: imageBase64,
+      mimeType: "image/jpeg",
+    },
   });
 
-  // Retry with exponential backoff for rate limits (429)
   let lastError;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
-      await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
+      await new Promise((r) => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
     }
 
     const response = await fetchWithTimeout(
-      "https://api.anthropic.com/v1/messages",
+      endpoint,
       {
         method: "POST",
         headers: {
+          Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
-          "x-api-key": anthropicKey,
-          "anthropic-version": "2023-06-01"
         },
-        body: requestBody
+        body: requestBody,
       },
-      30000
+      45000
     );
 
     if (response.ok) {
       return response.json();
     }
 
-    const err = await response.text();
-    lastError = "Claude API error: " + response.status + " - " + err;
+    const errText = await response.text();
+    lastError = `Document AI error (${response.status}): ${errText.slice(0, 300)}`;
 
-    // Only retry on 429 (rate limit) or 529 (overloaded)
-    if (response.status !== 429 && response.status !== 529) {
+    // Only retry on 429/500/503
+    if (response.status !== 429 && response.status !== 500 && response.status !== 503) {
       throw new Error(lastError);
     }
   }
 
   throw new Error(lastError);
 }
+
+// --- Map Document AI response to our invoice format ---
+
+function mapDocumentAIResponse(docAIResponse) {
+  const document = docAIResponse.document || docAIResponse;
+  const entities = document.entities || [];
+
+  const result = {
+    folio: "",
+    proveedor: "",
+    costo_neto: 0,
+    iva: 0,
+    costo_bruto: 0,
+    productos: [],
+  };
+
+  // Top-level fields
+  for (const entity of entities) {
+    const type = entity.type;
+    const text = (entity.mentionText || "").trim();
+    const value = entity.normalizedValue?.text || text;
+
+    switch (type) {
+      case "invoice_id":
+        result.folio = value;
+        break;
+      case "supplier_name":
+        result.proveedor = value;
+        break;
+      case "net_amount":
+        result.costo_neto = parseAmount(value);
+        break;
+      case "total_tax_amount":
+        result.iva = parseAmount(value);
+        break;
+      case "total_amount":
+        result.costo_bruto = parseAmount(value);
+        break;
+      case "line_item":
+        result.productos.push(parseLineItem(entity));
+        break;
+    }
+  }
+
+  // If no net amount but we have total and tax, calculate it
+  if (!result.costo_neto && result.costo_bruto && result.iva) {
+    result.costo_neto = Math.round((result.costo_bruto - result.iva) * 100) / 100;
+  }
+
+  return result;
+}
+
+function parseLineItem(entity) {
+  const item = {
+    sku: "",
+    nombre: "",
+    cantidad: 0,
+    costo_unitario: 0,
+    confianza: entity.confidence >= 0.8 ? "alta" : "baja",
+  };
+
+  const properties = entity.properties || [];
+  for (const prop of properties) {
+    const type = prop.type;
+    const text = (prop.mentionText || "").trim();
+    const value = prop.normalizedValue?.text || text;
+
+    switch (type) {
+      case "line_item/product_code":
+        item.sku = value;
+        break;
+      case "line_item/description":
+        item.nombre = value;
+        break;
+      case "line_item/quantity":
+        item.cantidad = parseInt(value, 10) || 0;
+        break;
+      case "line_item/unit_price":
+        item.costo_unitario = parseAmount(value);
+        break;
+    }
+  }
+
+  // If no SKU found, try to extract from description
+  if (!item.sku && item.nombre) {
+    const skuMatch = item.nombre.match(/^([A-Z0-9]{5,})\b/);
+    if (skuMatch) {
+      item.sku = skuMatch[1];
+      item.nombre = item.nombre.replace(skuMatch[0], "").trim();
+    }
+  }
+
+  return item;
+}
+
+function parseAmount(str) {
+  if (!str) return 0;
+  // Remove currency symbols, spaces, and handle Chilean/Spanish number format
+  const cleaned = str
+    .replace(/[^0-9.,-]/g, "")
+    .replace(/\.(?=\d{3})/g, "") // Remove thousand separators (dots before 3 digits)
+    .replace(",", "."); // Convert comma decimal to dot
+  return parseFloat(cleaned) || 0;
+}
+
+// --- Handler ---
 
 async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -180,8 +231,9 @@ async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  const visionKey = process.env.GOOGLE_VISION_API_KEY;
+  const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT;
+  const processorId = process.env.DOCUMENT_AI_PROCESSOR_ID;
+  const docAILocation = process.env.DOCUMENT_AI_LOCATION || "us";
 
   try {
     const body = req.body;
@@ -190,18 +242,27 @@ async function handler(req, res) {
       return res.status(400).json({ error: "Request body inválido." });
     }
 
-    // If body has imageBase64, use Vision+Claude pipeline
     if (body.imageBase64) {
-      if (!visionKey) {
+      if (!serviceAccountJson) {
         return res.status(500).json({
-          error: "GOOGLE_VISION_API_KEY no configurada en Vercel Environment Variables.",
-          hint: "Ve a Vercel → tu proyecto → Settings → Environment Variables y agrega GOOGLE_VISION_API_KEY"
+          error: "GOOGLE_SERVICE_ACCOUNT no configurada en Vercel Environment Variables.",
+          hint: "Ve a Vercel → tu proyecto → Settings → Environment Variables y agrega GOOGLE_SERVICE_ACCOUNT con el JSON de tu service account.",
         });
       }
-      if (!anthropicKey) {
+      if (!processorId) {
         return res.status(500).json({
-          error: "ANTHROPIC_API_KEY no configurada en Vercel Environment Variables.",
-          hint: "Ve a Vercel → tu proyecto → Settings → Environment Variables y agrega ANTHROPIC_API_KEY"
+          error: "DOCUMENT_AI_PROCESSOR_ID no configurada en Vercel Environment Variables.",
+          hint: "Crea un Invoice Parser en Google Cloud Console → Document AI → Create Processor, y agrega el ID del processor.",
+        });
+      }
+
+      let serviceAccount;
+      try {
+        serviceAccount = JSON.parse(serviceAccountJson);
+      } catch {
+        return res.status(500).json({
+          error: "GOOGLE_SERVICE_ACCOUNT tiene un JSON inválido.",
+          hint: "Asegúrate de pegar el contenido completo del archivo JSON de la service account.",
         });
       }
 
@@ -210,55 +271,38 @@ async function handler(req, res) {
         return res.status(400).json({ error: "Datos de imagen inválidos o vacíos." });
       }
 
-      // Check base64 size (~10MB limit for Vision API)
+      // Check base64 size (~20MB limit for Document AI)
       const estimatedBytes = body.imageBase64.length * 0.75;
-      if (estimatedBytes > 10 * 1024 * 1024) {
+      if (estimatedBytes > 20 * 1024 * 1024) {
         return res.status(413).json({
-          error: "Imagen demasiado grande para Vision API. Máximo ~10MB.",
-          hint: "La app debería comprimir la imagen automáticamente. Intenta recargar la página."
+          error: "Imagen demasiado grande. Máximo ~20MB.",
+          hint: "La app debería comprimir la imagen automáticamente. Intenta recargar la página.",
         });
       }
 
-      // Step 1: OCR with Google Vision (with retries)
-      const ocrText = await ocrWithVision(body.imageBase64, visionKey);
+      // Parse invoice with Document AI
+      const docAIResponse = await parseInvoiceWithDocumentAI(
+        body.imageBase64,
+        serviceAccount,
+        processorId,
+        docAILocation
+      );
 
-      // Step 2: Structure with Claude
-      const claudeResponse = await structureWithClaude(ocrText, body.skuList || "", anthropicKey);
+      // Map to our structured format
+      const parsed = mapDocumentAIResponse(docAIResponse);
 
       return res.status(200).json({
-        mode: "vision+claude",
-        ocrText: ocrText,
-        claudeResponse: claudeResponse
+        mode: "document-ai",
+        parsed: parsed,
+        ocrText: docAIResponse.document?.text || "",
       });
     }
 
-    // Fallback: pass through to Claude API directly (legacy/direct calls)
-    if (!anthropicKey) {
-      return res.status(500).json({ error: "ANTHROPIC_API_KEY no configurada." });
-    }
-
-    const claudeBody = JSON.stringify(body);
-    const response = await fetchWithTimeout(
-      "https://api.anthropic.com/v1/messages",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": anthropicKey,
-          "anthropic-version": "2023-06-01"
-        },
-        body: claudeBody
-      },
-      30000
-    );
-    const responseText = await response.text();
-    res.setHeader("Content-Type", "application/json");
-    return res.status(response.status).send(responseText);
+    return res.status(400).json({ error: "Se requiere imageBase64 en el body." });
 
   } catch (error) {
     console.error("Process error:", error);
 
-    // Provide user-friendly error messages
     let userMessage = error.message || "Error desconocido";
     if (error.message?.includes("fetch failed") || error.message?.includes("ENOTFOUND")) {
       userMessage = "No se pudo conectar con el servicio. Verifica tu conexión a internet.";
@@ -266,7 +310,7 @@ async function handler(req, res) {
 
     return res.status(500).json({
       error: userMessage,
-      type: error.name || "Error"
+      type: error.name || "Error",
     });
   }
 }
