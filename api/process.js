@@ -178,7 +178,8 @@ function parseLineItem(entity) {
   };
 
   const properties = entity.properties || [];
-  const allCodes = [];
+  let detectedCode = "";
+  let lineAmount = 0;
 
   for (const prop of properties) {
     const type = prop.type;
@@ -187,13 +188,12 @@ function parseLineItem(entity) {
 
     switch (type) {
       case "line_item/product_code":
-        allCodes.push(value);
+        detectedCode = value;
         break;
       case "line_item/description":
         item.nombre = value;
         break;
       case "line_item/quantity":
-        // Handle both integer and decimal formats: "4", "4.0", "4,0"
         const qtyStr = value.replace(",", ".");
         const qty = parseFloat(qtyStr);
         item.cantidad = !isNaN(qty) ? Math.round(qty) : 0;
@@ -202,47 +202,58 @@ function parseLineItem(entity) {
         item.costo_unitario = parseAmount(value);
         break;
       case "line_item/amount":
-        // Fallback: total line amount
-        if (!item.costo_unitario) {
-          item.costo_total = parseAmount(value);
-        }
+        lineAmount = parseAmount(value);
         break;
     }
   }
 
-  // Pick the best SKU from detected codes
-  // Idetex invoices have Cod.Alter (starts with letters like TXV, JSE, ALP)
-  // and Código column - both are valid, prefer the second one if two exist
-  if (allCodes.length >= 2) {
-    // If two codes detected, use the second (Código column)
-    item.sku = allCodes[1];
-  } else if (allCodes.length === 1) {
-    item.sku = allCodes[0];
-  }
+  // --- SKU extraction ---
+  // Document AI sometimes truncates SKUs (e.g., "XV23QLRM25GR" instead of "TXV23QLRM25GR")
+  // The mentionText contains the full line with both code columns, so extract from there
+  const fullText = (entity.mentionText || "").trim();
 
-  // If no SKU found, try to extract from description or mentionText
-  if (!item.sku) {
-    // Try from the full entity mentionText (may contain codes before description)
-    const fullText = (entity.mentionText || "").trim();
-    const skuMatch = fullText.match(/\b([A-Z]{2,}[A-Z0-9]{4,}[A-Z0-9]*)\b/);
-    if (skuMatch) {
-      item.sku = skuMatch[1];
-    }
-    // Also try from nombre
-    if (!item.sku && item.nombre) {
-      const nameMatch = item.nombre.match(/^([A-Z0-9]{5,})\b/);
-      if (nameMatch) {
-        item.sku = nameMatch[1];
-        item.nombre = item.nombre.replace(nameMatch[0], "").trim();
-      }
+  // Extract all uppercase alphanumeric codes (5+ chars) from the beginning of mentionText
+  // Pattern: "CODE1 CODE2 4 Description..." or "CODE1 CODE2 Description..."
+  const codeMatches = fullText.match(/^([A-Z][A-Z0-9]{4,})\s+([A-Z][A-Z0-9]{4,})/);
+  if (codeMatches) {
+    // Two codes found (Cod.Alter and Código) — use the second one (Código column)
+    item.sku = codeMatches[2];
+  } else {
+    // Try single code from mentionText
+    const singleCode = fullText.match(/^([A-Z][A-Z0-9]{4,})/);
+    if (singleCode) {
+      item.sku = singleCode[1];
+    } else {
+      // Fallback to Document AI detected code
+      item.sku = detectedCode;
     }
   }
 
-  // Calculate unit price from total if missing
-  if (!item.costo_unitario && item.costo_total && item.cantidad > 0) {
-    item.costo_unitario = Math.round((item.costo_total / item.cantidad) * 100) / 100;
+  // --- Quantity fallback ---
+  // Document AI often misses quantity (checkmarks ✓ in the column confuse OCR)
+  // Calculate from amount / unit_price when both are available
+  if (!item.cantidad && lineAmount > 0 && item.costo_unitario > 0) {
+    const calculated = Math.round(lineAmount / item.costo_unitario);
+    // Sanity check: recalculated total should match (within rounding tolerance)
+    if (Math.abs(calculated * item.costo_unitario - lineAmount) < 1) {
+      item.cantidad = calculated;
+    }
   }
-  delete item.costo_total;
+
+  // If still no quantity, try to extract from mentionText
+  // Pattern: "CODE CODE <number> Description" where number is 1-3 digits
+  if (!item.cantidad) {
+    const qtyFromText = fullText.match(/[A-Z0-9]{5,}\s+[A-Z0-9]{5,}\s+(\d{1,3})\s+[A-Z]/);
+    if (qtyFromText) {
+      item.cantidad = parseInt(qtyFromText[1], 10);
+    }
+  }
+
+  // --- Unit price fallback ---
+  // If no unit_price but we have amount and quantity, calculate it
+  if (!item.costo_unitario && lineAmount > 0 && item.cantidad > 0) {
+    item.costo_unitario = Math.round(lineAmount / item.cantidad);
+  }
 
   return item;
 }
