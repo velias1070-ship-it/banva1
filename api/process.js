@@ -451,6 +451,83 @@ function parseAmount(str) {
   return parseFloat(cleaned) || 0;
 }
 
+// --- Claude Vision fallback for merged line items ---
+
+async function reparseMergedWithClaude(imageBase64, apiKey) {
+  const response = await fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/jpeg",
+                  data: imageBase64,
+                },
+              },
+              {
+                type: "text",
+                text: `Extrae TODOS los productos de esta factura chilena. Para cada fila de la tabla de productos, devuelve:
+- sku: el código del producto (columna "Código" o "Cod.Alter.")
+- nombre: descripción del producto
+- cantidad: unidades (columna "Unid.")
+- costo_unitario: precio unitario sin separador de miles (ej: 3400, no 3.400)
+
+IMPORTANTE:
+- Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos)
+- Devuelve costo_unitario como número entero sin puntos (ej: 3400, 8500, 11000)
+- Devuelve cantidad como número entero
+- NO omitas ningún producto, extrae TODAS las filas de la tabla
+- Si hay checkmarks (✓) en la columna de unidades, ignóralos y lee solo el número
+
+Responde SOLO con un JSON array, sin texto adicional ni markdown:
+[{"sku":"...","nombre":"...","cantidad":0,"costo_unitario":0}]`,
+              },
+            ],
+          },
+        ],
+      }),
+    },
+    55000
+  );
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Claude API error (${response.status}): ${errText.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  const text = data.content?.[0]?.text || "";
+
+  // Extract JSON from response (handle potential markdown wrapping)
+  const jsonMatch = text.match(/\[[\s\S]*\]/);
+  if (!jsonMatch) {
+    throw new Error("Claude no devolvió JSON válido");
+  }
+
+  const items = JSON.parse(jsonMatch[0]);
+  return items.map((item) => ({
+    sku: String(item.sku || "").trim(),
+    nombre: String(item.nombre || "").trim(),
+    cantidad: parseInt(item.cantidad, 10) || 0,
+    costo_unitario: parseInt(item.costo_unitario, 10) || 0,
+    confianza: "alta",
+  }));
+}
+
 // --- Handler ---
 
 async function handler(req, res) {
@@ -534,6 +611,38 @@ async function handler(req, res) {
 
       // Map to our structured format
       const parsed = mapDocumentAIResponse(docAIResponse);
+
+      // Check if Document AI produced merged/incomplete items
+      const hasMergedItems = parsed.productos.some(
+        (p) => p.confianza === "baja"
+      );
+
+      // Fallback: re-parse products with Claude Vision if merged items detected
+      const anthropicKey = process.env.ANTHROPIC_API_KEY;
+      if (hasMergedItems && anthropicKey) {
+        try {
+          console.log("Merged items detected, falling back to Claude Vision...");
+          const claudeProducts = await reparseMergedWithClaude(
+            body.imageBase64,
+            anthropicKey
+          );
+          if (claudeProducts.length > 0) {
+            parsed.productos = claudeProducts;
+            console.log(
+              `Claude Vision extracted ${claudeProducts.length} products`
+            );
+            return res.status(200).json({
+              mode: "document-ai+claude",
+              parsed: parsed,
+              ocrText: document.text || "",
+              debugEntities: rawEntities,
+            });
+          }
+        } catch (claudeErr) {
+          console.error("Claude fallback failed:", claudeErr.message);
+          // Continue with Document AI results
+        }
+      }
 
       return res.status(200).json({
         mode: "document-ai",
