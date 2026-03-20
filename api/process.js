@@ -178,6 +178,8 @@ function parseLineItem(entity) {
   };
 
   const properties = entity.properties || [];
+  const allCodes = [];
+
   for (const prop of properties) {
     const type = prop.type;
     const text = (prop.mentionText || "").trim();
@@ -185,28 +187,62 @@ function parseLineItem(entity) {
 
     switch (type) {
       case "line_item/product_code":
-        item.sku = value;
+        allCodes.push(value);
         break;
       case "line_item/description":
         item.nombre = value;
         break;
       case "line_item/quantity":
-        item.cantidad = parseInt(value, 10) || 0;
+        // Handle both integer and decimal formats: "4", "4.0", "4,0"
+        const qtyStr = value.replace(",", ".");
+        const qty = parseFloat(qtyStr);
+        item.cantidad = !isNaN(qty) ? Math.round(qty) : 0;
         break;
       case "line_item/unit_price":
         item.costo_unitario = parseAmount(value);
         break;
+      case "line_item/amount":
+        // Fallback: total line amount
+        if (!item.costo_unitario) {
+          item.costo_total = parseAmount(value);
+        }
+        break;
     }
   }
 
-  // If no SKU found, try to extract from description
-  if (!item.sku && item.nombre) {
-    const skuMatch = item.nombre.match(/^([A-Z0-9]{5,})\b/);
+  // Pick the best SKU from detected codes
+  // Idetex invoices have Cod.Alter (starts with letters like TXV, JSE, ALP)
+  // and Código column - both are valid, prefer the second one if two exist
+  if (allCodes.length >= 2) {
+    // If two codes detected, use the second (Código column)
+    item.sku = allCodes[1];
+  } else if (allCodes.length === 1) {
+    item.sku = allCodes[0];
+  }
+
+  // If no SKU found, try to extract from description or mentionText
+  if (!item.sku) {
+    // Try from the full entity mentionText (may contain codes before description)
+    const fullText = (entity.mentionText || "").trim();
+    const skuMatch = fullText.match(/\b([A-Z]{2,}[A-Z0-9]{4,}[A-Z0-9]*)\b/);
     if (skuMatch) {
       item.sku = skuMatch[1];
-      item.nombre = item.nombre.replace(skuMatch[0], "").trim();
+    }
+    // Also try from nombre
+    if (!item.sku && item.nombre) {
+      const nameMatch = item.nombre.match(/^([A-Z0-9]{5,})\b/);
+      if (nameMatch) {
+        item.sku = nameMatch[1];
+        item.nombre = item.nombre.replace(nameMatch[0], "").trim();
+      }
     }
   }
+
+  // Calculate unit price from total if missing
+  if (!item.costo_unitario && item.costo_total && item.cantidad > 0) {
+    item.costo_unitario = Math.round((item.costo_total / item.cantidad) * 100) / 100;
+  }
+  delete item.costo_total;
 
   return item;
 }
@@ -288,13 +324,28 @@ async function handler(req, res) {
         docAILocation
       );
 
+      // Log raw entities for debugging
+      const document = docAIResponse.document || docAIResponse;
+      const rawEntities = (document.entities || []).map((e) => ({
+        type: e.type,
+        mentionText: (e.mentionText || "").slice(0, 200),
+        confidence: e.confidence,
+        properties: (e.properties || []).map((p) => ({
+          type: p.type,
+          mentionText: (p.mentionText || "").slice(0, 200),
+          confidence: p.confidence,
+        })),
+      }));
+      console.log("Document AI entities:", JSON.stringify(rawEntities, null, 2));
+
       // Map to our structured format
       const parsed = mapDocumentAIResponse(docAIResponse);
 
       return res.status(200).json({
         mode: "document-ai",
         parsed: parsed,
-        ocrText: docAIResponse.document?.text || "",
+        ocrText: document.text || "",
+        debugEntities: rawEntities,
       });
     }
 
