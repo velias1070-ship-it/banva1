@@ -792,6 +792,14 @@ function App() {
 
       // Parse Document AI response (already structured)
       const parsed = data.parsed;
+
+      // Debug: log raw entities to browser console
+      if (data.debugEntities) {
+        console.log("=== Document AI Debug Entities ===");
+        console.log(JSON.stringify(data.debugEntities, null, 2));
+      }
+      console.log("=== Parsed Products ===");
+      console.log(JSON.stringify(parsed.productos, null, 2));
       
       setFolioFactura(parsed.folio || "");
       setProveedorFactura(parsed.proveedor || "");
