@@ -339,28 +339,49 @@ function splitMergedItems(descriptions, fullText) {
     }
   }
 
-  // Build one item per description, matching codes by order
+  // Match codes to descriptions by CONTENT similarity (not position)
+  // because Document AI may scramble the order when merging
+  const usedCodes = new Set();
   const items = [];
-  for (let i = 0; i < descriptions.length; i++) {
+
+  for (const desc of descriptions) {
     const item = {
-      sku: uniqueCodes[i] || "",
-      nombre: descriptions[i],
+      sku: "",
+      nombre: desc,
       cantidad: 0,
       costo_unitario: 0,
       confianza: "baja", // Merged items always need manual review
     };
 
+    // Find the best matching code for this description
+    let bestCode = "";
+    let bestScore = 0;
+
+    for (const code of uniqueCodes) {
+      if (usedCodes.has(code)) continue;
+      const score = codeDescriptionMatchScore(code, desc);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCode = code;
+      }
+    }
+
+    if (bestCode && bestScore >= 2) {
+      item.sku = bestCode;
+      usedCodes.add(bestCode);
+    }
+
     // Try to find this description in fullText and extract surrounding numbers
-    const descIdx = fullText.indexOf(item.nombre);
+    const descIdx = fullText.indexOf(desc);
     if (descIdx >= 0) {
       // Look for price right after the description (format: X.XXX or X,XXX)
-      const afterDesc = fullText.substring(descIdx + item.nombre.length);
+      const afterDesc = fullText.substring(descIdx + desc.length);
       const priceMatch = afterDesc.match(/^\s+(\d{1,3}[.,]\d{3})/);
       if (priceMatch) {
         item.costo_unitario = parseAmount(priceMatch[1]);
       }
 
-      // Look for total amount after price (format: X.XXX or XX.XXX)
+      // Look for total amount after price to calculate quantity
       if (item.costo_unitario) {
         const amountMatch = afterDesc.match(
           /^\s+\d{1,3}[.,]\d{3}\s+(\d{1,3}[.,]\d{3})/
@@ -381,6 +402,43 @@ function splitMergedItems(descriptions, fullText) {
   }
 
   return items;
+}
+
+// Score how well a SKU code matches a product description
+// Higher score = better match. Used to pair codes with descriptions
+// when Document AI merges multiple line items.
+function codeDescriptionMatchScore(code, description) {
+  let score = 0;
+
+  // Match product family prefixes (most reliable signal)
+  if (description.match(/Limpia/) && code.includes("CMPR")) score += 2;
+  if (description.includes("Sabanas AF") && code.includes("SAFAB")) score += 4;
+  if (description.includes("Sabanas EC") && code.includes("SECBQ")) score += 4;
+  if (description.includes("Sabanas RS") && code.includes("SRSBH")) score += 4;
+  if (description.includes("Quilt") && code.includes("QL")) score += 4;
+
+  // Match size dimensions: "40 x 60" → code should contain "4060"
+  const sizeMatch = description.match(/(\d{2,3})\s*x\s*(\d{2,3})/);
+  if (sizeMatch) {
+    // Use first 2 digits of each dimension (60 x 120 → "6012")
+    const d1 = sizeMatch[1].substring(0, 2);
+    const d2 = sizeMatch[2].substring(0, 2);
+    const sizeStr = d1 + d2;
+    if (code.includes(sizeStr)) score += 3;
+  }
+
+  // Match variant name initials (last alpha word → first 2 chars in code)
+  // "Limpiapies Coco 40 x 60 Border" → "BO" should be in code
+  const words = description
+    .split(/\s+/)
+    .filter((w) => /^[A-Za-z]{3,}$/.test(w));
+  if (words.length > 0) {
+    const lastWord = words[words.length - 1];
+    const initials = lastWord.substring(0, 2).toUpperCase();
+    if (code.includes(initials)) score += 1;
+  }
+
+  return score;
 }
 
 function parseAmount(str) {
