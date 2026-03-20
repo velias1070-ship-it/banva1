@@ -453,7 +453,12 @@ function parseAmount(str) {
 
 // --- Claude Vision fallback for merged line items ---
 
-async function reparseMergedWithClaude(imageBase64, apiKey) {
+async function reparseMergedWithClaude(imageBase64, apiKey, knownSkus) {
+  // Build SKU hint if we have known SKUs from Document AI
+  const skuHint = knownSkus && knownSkus.length > 0
+    ? `\nREFERENCIA DE SKUs: Document AI detectó estos códigos en la factura: ${knownSkus.join(", ")}. Usa estos como referencia para el formato correcto de los SKUs.`
+    : "";
+
   const response = await fetchWithTimeout(
     "https://api.anthropic.com/v1/messages",
     {
@@ -481,17 +486,19 @@ async function reparseMergedWithClaude(imageBase64, apiKey) {
               {
                 type: "text",
                 text: `Extrae TODOS los productos de esta factura chilena. Para cada fila de la tabla de productos, devuelve:
-- sku: el código del producto (columna "Código" o "Cod.Alter.")
+- sku: el código del producto EXACTO como aparece en la columna "Código" o "Cod.Alter." de la factura
 - nombre: descripción del producto
 - cantidad: unidades (columna "Unid.")
 - costo_unitario: precio unitario sin separador de miles (ej: 3400, no 3.400)
 
 IMPORTANTE:
+- Los SKUs deben ser EXACTAMENTE como aparecen impresos en la factura. NO los inventes ni los modifiques. Si no puedes leer el SKU claramente, déjalo como cadena vacía "".
 - Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos)
 - Devuelve costo_unitario como número entero sin puntos (ej: 3400, 8500, 11000)
 - Devuelve cantidad como número entero
 - NO omitas ningún producto, extrae TODAS las filas de la tabla
 - Si hay checkmarks (✓) en la columna de unidades, ignóralos y lee solo el número
+- Cada fila de la tabla es un producto SEPARADO, no agrupes filas${skuHint}
 
 Responde SOLO con un JSON array, sin texto adicional ni markdown:
 [{"sku":"...","nombre":"...","cantidad":0,"costo_unitario":0}]`,
@@ -622,9 +629,20 @@ async function handler(req, res) {
       if (hasMergedItems && anthropicKey) {
         try {
           console.log("Merged items detected, falling back to Claude Vision...");
+          // Collect known SKUs from Document AI to help Claude
+          const knownSkus = rawEntities
+            .filter((e) => e.type === "line_item")
+            .map((e) => {
+              const codeProp = (e.properties || []).find(
+                (p) => p.type === "line_item/product_code"
+              );
+              return codeProp ? codeProp.mentionText.trim() : "";
+            })
+            .filter((s) => s.length > 0);
           const claudeProducts = await reparseMergedWithClaude(
             body.imageBase64,
-            anthropicKey
+            anthropicKey,
+            knownSkus
           );
           if (claudeProducts.length > 0) {
             parsed.productos = claudeProducts;
