@@ -618,7 +618,7 @@ async function handler(req, res) {
       );
 
       // Fallback: re-parse products with Claude Vision if merged items detected
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
+      const anthropicKey = process.env.EtiquetasBanva;
       if (hasMergedItems && anthropicKey) {
         try {
           console.log("Merged items detected, falling back to Claude Vision...");
