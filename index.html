@@ -582,7 +582,7 @@ function App() {
     }
   }, [dictionary]);
 
-  // ---- Image Upload (with compression for Vision API) ----
+  // ---- Image Upload (with compression for Document AI) ----
   const compressImage = useCallback((dataUrl, maxWidth = 2048, quality = 0.85) => {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -760,25 +760,19 @@ function App() {
     if (!invoiceImageBase64) return;
 
     setProcessing(true);
-    setProcessingStatus("📷 Enviando imagen a Google Vision OCR...");
+    setProcessingStatus("📄 Enviando imagen a Document AI...");
     setError(null);
     setStep("processing");
 
     try {
-      // Send image to Vision+Claude pipeline
-      const skuListStr = dictionary.length > 0
-        ? dictionary.slice(0, 100).map(d => d.sku).join(", ")
-        : "";
-
       const imgSizeKB = Math.round(invoiceImageBase64.length * 0.75 / 1024);
-      setProcessingStatus(`📷 Enviando imagen (${imgSizeKB}KB) a Google Vision OCR...`);
+      setProcessingStatus(`📄 Procesando factura (${imgSizeKB}KB) con Document AI...`);
 
       const response = await fetch("/api/process", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          imageBase64: invoiceImageBase64,
-          skuList: skuListStr
+          imageBase64: invoiceImageBase64
         })
       });
 
@@ -794,28 +788,10 @@ function App() {
         throw new Error(data.error + hint);
       }
 
-      setProcessingStatus("🤖 Estructurando datos con IA...");
+      setProcessingStatus("📊 Estructurando datos de la factura...");
 
-      // Parse Claude's response from the pipeline
-      let parsed;
-      if (data.mode === "vision+claude" && data.claudeResponse) {
-        const text = data.claudeResponse.content?.map(c => c.text || "").join("") || "";
-        const cleanJson = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-        
-        try {
-          parsed = JSON.parse(cleanJson);
-        } catch(e) {
-          const match = cleanJson.match(/\{[\s\S]*\}/);
-          if (match) parsed = JSON.parse(match[0]);
-          else throw new Error("No se pudo parsear la respuesta de la IA");
-        }
-      } else {
-        // Fallback for legacy response format
-        const text = data.content?.map(c => c.text || "").join("") || "";
-        const cleanJson = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-        const match = cleanJson.match(/\{[\s\S]*\}/);
-        parsed = JSON.parse(match ? match[0] : cleanJson);
-      }
+      // Parse Document AI response (already structured)
+      const parsed = data.parsed;
       
       setFolioFactura(parsed.folio || "");
       setProveedorFactura(parsed.proveedor || "");
@@ -1823,7 +1799,7 @@ function App() {
             <div style={styles.spinner}></div>
             <h3 style={{marginTop: 20}}>{processingStatus}</h3>
             <p style={{color: "#888", fontSize: 13, marginTop: 8}}>
-              Google Vision OCR → Claude IA
+              Google Document AI Invoice Parser
             </p>
             {invoiceImage && (
               <img src={invoiceImage} alt="Procesando" style={styles.processingImg} />
