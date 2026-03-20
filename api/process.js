@@ -155,7 +155,7 @@ function mapDocumentAIResponse(docAIResponse) {
         result.costo_bruto = parseAmount(value);
         break;
       case "line_item":
-        result.productos.push(parseLineItem(entity));
+        result.productos.push(...parseLineItems(entity));
         break;
     }
   }
@@ -168,94 +168,219 @@ function mapDocumentAIResponse(docAIResponse) {
   return result;
 }
 
-function parseLineItem(entity) {
-  const item = {
-    sku: "",
-    nombre: "",
-    cantidad: 0,
-    costo_unitario: 0,
-    confianza: entity.confidence >= 0.8 ? "alta" : "baja",
-  };
-
+// Returns an array of items (handles merged entities that contain multiple products)
+function parseLineItems(entity) {
   const properties = entity.properties || [];
+  const fullText = (entity.mentionText || "").trim();
+
+  // Extract all properties from Document AI
+  let description = "";
   let detectedCode = "";
-  let lineAmount = 0;
+  let detectedQty = 0;
+  let detectedPrice = 0;
+  let detectedAmount = 0;
 
   for (const prop of properties) {
-    const type = prop.type;
     const text = (prop.mentionText || "").trim();
     const value = prop.normalizedValue?.text || text;
-
-    switch (type) {
+    switch (prop.type) {
+      case "line_item/description":
+        description = value;
+        break;
       case "line_item/product_code":
         detectedCode = value;
         break;
-      case "line_item/description":
-        item.nombre = value;
+      case "line_item/quantity": {
+        const q = parseFloat(value.replace(",", "."));
+        detectedQty = !isNaN(q) ? Math.round(q) : 0;
         break;
-      case "line_item/quantity":
-        const qtyStr = value.replace(",", ".");
-        const qty = parseFloat(qtyStr);
-        item.cantidad = !isNaN(qty) ? Math.round(qty) : 0;
-        break;
+      }
       case "line_item/unit_price":
-        item.costo_unitario = parseAmount(value);
+        detectedPrice = parseAmount(value);
         break;
       case "line_item/amount":
-        lineAmount = parseAmount(value);
+        detectedAmount = parseAmount(value);
         break;
     }
   }
 
-  // --- SKU extraction ---
-  // Document AI sometimes truncates SKUs (e.g., "XV23QLRM25GR" instead of "TXV23QLRM25GR")
-  // The mentionText contains the full line with both code columns, so extract from there
-  const fullText = (entity.mentionText || "").trim();
+  // Filter ghost entities (no description, no code — just a stray amount)
+  if (!description && !detectedCode && !detectedQty) {
+    return [];
+  }
 
-  // Extract all uppercase alphanumeric codes (5+ chars) from the beginning of mentionText
-  // Pattern: "CODE1 CODE2 4 Description..." or "CODE1 CODE2 Description..."
-  const codeMatches = fullText.match(/^([A-Z][A-Z0-9]{4,})\s+([A-Z][A-Z0-9]{4,})/);
-  if (codeMatches) {
-    // Two codes found (Cod.Alter and Código) — use the second one (Código column)
-    item.sku = codeMatches[2];
+  // Check if this is a merged entity (multiple descriptions separated by newlines)
+  const descriptions = description
+    .split("\n")
+    .map((d) => d.trim())
+    .filter(Boolean);
+
+  if (descriptions.length <= 1) {
+    // Single item — use detailed parsing
+    return [
+      parseSingleItem(
+        fullText,
+        description,
+        detectedCode,
+        detectedQty,
+        detectedPrice,
+        detectedAmount,
+        entity.confidence
+      ),
+    ];
+  }
+
+  // --- Merged entity: split into individual items ---
+  return splitMergedItems(descriptions, fullText);
+}
+
+function parseSingleItem(
+  fullText,
+  description,
+  detectedCode,
+  detectedQty,
+  detectedPrice,
+  detectedAmount,
+  confidence
+) {
+  const item = {
+    sku: "",
+    nombre: description,
+    cantidad: detectedQty,
+    costo_unitario: detectedPrice,
+    confianza: confidence >= 0.8 ? "alta" : "baja",
+  };
+
+  // --- SKU extraction ---
+  // Try codes at the START of mentionText: "CODE1 CODE2 qty Description..."
+  const codesAtStart = fullText.match(
+    /^([A-Z][A-Z0-9]{4,})\s+([A-Z][A-Z0-9]{4,})/
+  );
+  if (codesAtStart) {
+    item.sku = codesAtStart[2];
   } else {
-    // Try single code from mentionText
-    const singleCode = fullText.match(/^([A-Z][A-Z0-9]{4,})/);
-    if (singleCode) {
-      item.sku = singleCode[1];
-    } else {
-      // Fallback to Document AI detected code
-      item.sku = detectedCode;
+    const singleStart = fullText.match(/^([A-Z][A-Z0-9]{4,})/);
+    if (singleStart) {
+      item.sku = singleStart[1];
     }
+  }
+
+  // Try codes at the END of mentionText: "Description price amount CODE1 CODE2"
+  if (!item.sku) {
+    const codesAtEnd = fullText.match(
+      /([A-Z]{2}[A-Z0-9]{8,})\s+([A-Z]{2}[A-Z0-9]{8,})\s*$/
+    );
+    if (codesAtEnd) {
+      item.sku = codesAtEnd[2];
+    } else {
+      // Single code at end
+      const singleEnd = fullText.match(/([A-Z]{2}[A-Z0-9]{8,})\s*$/);
+      if (singleEnd) {
+        item.sku = singleEnd[1];
+      }
+    }
+  }
+
+  // Final fallback: use Document AI detected code
+  if (!item.sku) {
+    item.sku = detectedCode;
   }
 
   // --- Quantity fallback ---
-  // Document AI often misses quantity (checkmarks ✓ in the column confuse OCR)
-  // Calculate from amount / unit_price when both are available
-  if (!item.cantidad && lineAmount > 0 && item.costo_unitario > 0) {
-    const calculated = Math.round(lineAmount / item.costo_unitario);
-    // Sanity check: recalculated total should match (within rounding tolerance)
-    if (Math.abs(calculated * item.costo_unitario - lineAmount) < 1) {
+  // Calculate from amount / unit_price when Document AI missed the quantity
+  if (!item.cantidad && detectedAmount > 0 && item.costo_unitario > 0) {
+    const calculated = Math.round(detectedAmount / item.costo_unitario);
+    if (Math.abs(calculated * item.costo_unitario - detectedAmount) < 1) {
       item.cantidad = calculated;
     }
   }
 
-  // If still no quantity, try to extract from mentionText
-  // Pattern: "CODE CODE <number> Description" where number is 1-3 digits
+  // Try extracting from mentionText: "CODE CODE <qty> Description"
   if (!item.cantidad) {
-    const qtyFromText = fullText.match(/[A-Z0-9]{5,}\s+[A-Z0-9]{5,}\s+(\d{1,3})\s+[A-Z]/);
+    const qtyFromText = fullText.match(
+      /[A-Z0-9]{5,}\s+[A-Z0-9]{5,}\s+(\d{1,3})\s+[A-Z]/
+    );
     if (qtyFromText) {
       item.cantidad = parseInt(qtyFromText[1], 10);
     }
   }
 
   // --- Unit price fallback ---
-  // If no unit_price but we have amount and quantity, calculate it
-  if (!item.costo_unitario && lineAmount > 0 && item.cantidad > 0) {
-    item.costo_unitario = Math.round(lineAmount / item.cantidad);
+  if (!item.costo_unitario && detectedAmount > 0 && item.cantidad > 0) {
+    item.costo_unitario = Math.round(detectedAmount / item.cantidad);
   }
 
   return item;
+}
+
+function splitMergedItems(descriptions, fullText) {
+  // Extract all potential SKU codes from mentionText
+  // Idetex SKUs: 10+ chars, uppercase, mix of letters and digits
+  const allCodes = [];
+  const codeRegex = /\b([A-Z]{2,}[A-Z0-9]*\d[A-Z0-9]*)\b/g;
+  let match;
+  while ((match = codeRegex.exec(fullText)) !== null) {
+    const code = match[1];
+    if (code.length >= 10 && /[A-Z]/.test(code) && /\d/.test(code)) {
+      allCodes.push(code);
+    }
+  }
+
+  // Deduplicate codes — Cod.Alter and Código are the same value,
+  // but OCR may confuse O/0, so normalize before comparing
+  const uniqueCodes = [];
+  for (const code of allCodes) {
+    const normalized = code.replace(/O/g, "0");
+    const isDuplicate = uniqueCodes.some(
+      (existing) => existing.replace(/O/g, "0") === normalized
+    );
+    if (!isDuplicate) {
+      uniqueCodes.push(code);
+    }
+  }
+
+  // Build one item per description, matching codes by order
+  const items = [];
+  for (let i = 0; i < descriptions.length; i++) {
+    const item = {
+      sku: uniqueCodes[i] || "",
+      nombre: descriptions[i],
+      cantidad: 0,
+      costo_unitario: 0,
+      confianza: "baja", // Merged items always need manual review
+    };
+
+    // Try to find this description in fullText and extract surrounding numbers
+    const descIdx = fullText.indexOf(item.nombre);
+    if (descIdx >= 0) {
+      // Look for price right after the description (format: X.XXX or X,XXX)
+      const afterDesc = fullText.substring(descIdx + item.nombre.length);
+      const priceMatch = afterDesc.match(/^\s+(\d{1,3}[.,]\d{3})/);
+      if (priceMatch) {
+        item.costo_unitario = parseAmount(priceMatch[1]);
+      }
+
+      // Look for total amount after price (format: X.XXX or XX.XXX)
+      if (item.costo_unitario) {
+        const amountMatch = afterDesc.match(
+          /^\s+\d{1,3}[.,]\d{3}\s+(\d{1,3}[.,]\d{3})/
+        );
+        if (amountMatch) {
+          const amount = parseAmount(amountMatch[1]);
+          if (amount > 0) {
+            const qty = Math.round(amount / item.costo_unitario);
+            if (Math.abs(qty * item.costo_unitario - amount) < 1) {
+              item.cantidad = qty;
+            }
+          }
+        }
+      }
+    }
+
+    items.push(item);
+  }
+
+  return items;
 }
 
 function parseAmount(str) {
