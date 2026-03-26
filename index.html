@@ -760,13 +760,13 @@ function App() {
     if (!invoiceImageBase64) return;
 
     setProcessing(true);
-    setProcessingStatus("📄 Enviando imagen a Document AI...");
+    setProcessingStatus("📄 Enviando imagen...");
     setError(null);
     setStep("processing");
 
     try {
       const imgSizeKB = Math.round(invoiceImageBase64.length * 0.75 / 1024);
-      setProcessingStatus(`📄 Procesando factura (${imgSizeKB}KB) con Document AI...`);
+      setProcessingStatus(`📄 Leyendo factura (${imgSizeKB}KB) con OCR + IA...`);
 
       const response = await fetch("/api/process", {
         method: "POST",
@@ -778,8 +778,12 @@ function App() {
 
       let data;
       try {
-        data = await response.json();
+        const rawText = await response.text();
+        data = JSON.parse(rawText);
       } catch (parseErr) {
+        if (parseErr.message.includes("EOF") || parseErr.message.includes("Unexpected end")) {
+          throw new Error("La respuesta del servidor se cortó (timeout). Intenta con una imagen más pequeña o de mejor calidad.");
+        }
         throw new Error("El servidor no respondió correctamente. Intenta de nuevo.");
       }
 
