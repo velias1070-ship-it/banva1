@@ -28,16 +28,15 @@ async function fetchWithTimeout(url, options, timeoutMs = 30000) {
 
 // --- Google Cloud Vision OCR ---
 
-async function ocrWithVision(imageBase64, apiKey, retries = 2) {
+async function ocrWithVision(imageBase64, apiKey, retries = 1) {
   const payload = JSON.stringify({
     requests: [{
       image: { content: imageBase64 },
       features: [
-        { type: "DOCUMENT_TEXT_DETECTION" },
-        { type: "TEXT_DETECTION" }
+        { type: "DOCUMENT_TEXT_DETECTION" }
       ],
       imageContext: {
-        languageHints: ["es", "en"]
+        languageHints: ["es"]
       }
     }]
   });
@@ -52,7 +51,7 @@ async function ocrWithVision(imageBase64, apiKey, retries = 2) {
           headers: { "Content-Type": "application/json" },
           body: payload
         },
-        35000
+        20000
       );
 
       if (!response.ok) {
@@ -108,7 +107,7 @@ async function ocrWithVision(imageBase64, apiKey, retries = 2) {
 // --- Claude Sonnet: structure OCR text into invoice data ---
 
 async function structureWithClaude(ocrText, anthropicKey) {
-  const truncatedOcr = ocrText.length > 8000 ? ocrText.slice(0, 8000) : ocrText;
+  const truncatedOcr = ocrText.length > 6000 ? ocrText.slice(0, 6000) : ocrText;
 
   const systemPrompt = `Eres un sistema de extracción de datos de facturas chilenas. Recibes texto OCR de una factura y extraes los productos.
 
@@ -128,7 +127,7 @@ Responde SOLO JSON válido:
 
   const requestBody = JSON.stringify({
     model: "claude-sonnet-4-20250514",
-    max_tokens: 4000,
+    max_tokens: 3000,
     system: systemPrompt,
     messages: [{
       role: "user",
@@ -136,49 +135,35 @@ Responde SOLO JSON válido:
     }]
   });
 
-  let lastError;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) {
-      await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
-    }
-
-    const response = await fetchWithTimeout(
-      "https://api.anthropic.com/v1/messages",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": anthropicKey,
-          "anthropic-version": "2023-06-01"
-        },
-        body: requestBody
+  const response = await fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": anthropicKey,
+        "anthropic-version": "2023-06-01"
       },
-      30000
-    );
+      body: requestBody
+    },
+    35000
+  );
 
-    if (response.ok) {
-      const data = await response.json();
-      const text = data.content?.[0]?.text || "";
-
-      // Extract JSON from response (handle potential markdown wrapping)
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error("Claude no devolvió JSON válido");
-      }
-
-      return JSON.parse(jsonMatch[0]);
-    }
-
+  if (!response.ok) {
     const err = await response.text();
-    lastError = "Claude API error: " + response.status + " - " + err;
-
-    // Only retry on 429 (rate limit) or 529 (overloaded)
-    if (response.status !== 429 && response.status !== 529) {
-      throw new Error(lastError);
-    }
+    throw new Error("Claude API error: " + response.status + " - " + err.slice(0, 300));
   }
 
-  throw new Error(lastError);
+  const data = await response.json();
+  const text = data.content?.[0]?.text || "";
+
+  // Extract JSON from response (handle potential markdown wrapping)
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error("Claude no devolvió JSON válido");
+  }
+
+  return JSON.parse(jsonMatch[0]);
 }
 
 // --- Handler ---
