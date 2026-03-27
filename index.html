@@ -813,18 +813,21 @@ function App() {
       setWmsStatus(""); setWmsError("");
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
-      // Cross-reference with dictionary - EXACT match only
+      // Cross-reference with dictionary - exact + OCR fuzzy match (I↔1, O↔0, etc.)
       const pendingVariants = [];
       const enriched = (parsed.productos || []).map((p, idx) => {
         const skuUp = (p.sku || "").toUpperCase().trim();
-        // Find ALL matches (same SKU proveedor can have multiple products: pack vs individual)
-        const matches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+        // Find ALL matches using fuzzy OCR matching
+        const matches = fuzzyOcrMatch(skuUp, dictionary);
+        const isFuzzy = matches.length > 0 && matches[0].sku.toUpperCase() !== skuUp;
+        const correctedSku = matches.length > 0 ? matches[0].sku.toUpperCase() : skuUp;
 
         if (matches.length > 1) {
           // Multiple publications for same origin SKU — needs user selection
-          pendingVariants.push({ productIdx: idx, sku: skuUp, matches, selected: null });
+          pendingVariants.push({ productIdx: idx, sku: correctedSku, matches, selected: null });
           return {
             ...p,
+            sku: isFuzzy ? correctedSku : p.sku,
             costo: p.costo_unitario || 0,
             codigoML: "",
             nombreDict: "",
@@ -836,13 +839,14 @@ function App() {
             altCount: matches.length,
             needsVariantSelection: true,
             etiquetaImpresa: true,
-            skuOriginal: ""
+            skuOriginal: isFuzzy ? p.sku : ""
           };
         }
 
         const match = matches[0] || null;
         return {
           ...p,
+          sku: isFuzzy ? correctedSku : p.sku,
           costo: p.costo_unitario || 0,
           codigoML: match?.codigoML || "",
           nombreDict: match?.nombre || "",
@@ -850,11 +854,11 @@ function App() {
           cantPack: match?.cantPack || 1,
           isPack: match?.isPack || false,
           matched: !!match,
-          matchType: match ? "exacto" : "",
+          matchType: match ? (isFuzzy ? "ocr-fuzzy" : "exacto") : "",
           altCount: 0,
           needsVariantSelection: false,
           etiquetaImpresa: true,
-          skuOriginal: ""
+          skuOriginal: isFuzzy ? p.sku : ""
         };
       });
 
@@ -1115,18 +1119,54 @@ function App() {
     summaryWindow.document.close();
   }, [extractedProducts, folioFactura, labelPages]);
 
-  // ---- Update product field ----
+  // ---- OCR fuzzy matching: handle I↔1, O↔0, S↔5, B↔8 confusions ----
+  const OCR_CONFUSIONS = [["I","1"],["O","0"],["S","5"],["B","8"],["G","6"],["Z","2"]];
+
+  const fuzzyOcrMatch = useCallback((ocrSku, dictEntries) => {
+    if (!ocrSku) return [];
+    const skuUp = ocrSku.toUpperCase().trim();
+
+    // Try exact first
+    const exact = dictEntries.filter(d => d.sku.toUpperCase() === skuUp);
+    if (exact.length > 0) return exact;
+
+    // Generate variants by swapping confusable chars
+    // For each position that has a confusable char, try the alternative
+    const variants = new Set();
+    for (const [a, b] of OCR_CONFUSIONS) {
+      if (skuUp.includes(a)) variants.add(skuUp.replaceAll(a, b));
+      if (skuUp.includes(b)) variants.add(skuUp.replaceAll(b, a));
+      // Also try single-position swaps for mixed cases like "1441" → "144I"
+      for (let i = 0; i < skuUp.length; i++) {
+        if (skuUp[i] === a) {
+          variants.add(skuUp.slice(0, i) + b + skuUp.slice(i + 1));
+        } else if (skuUp[i] === b) {
+          variants.add(skuUp.slice(0, i) + a + skuUp.slice(i + 1));
+        }
+      }
+    }
+
+    for (const variant of variants) {
+      const found = dictEntries.filter(d => d.sku.toUpperCase() === variant);
+      if (found.length > 0) return found;
+    }
+
+    // Also try against skuVenta
+    for (const variant of [skuUp, ...variants]) {
+      const found = dictEntries.filter(d => (d.skuVenta || "").toUpperCase() === variant);
+      if (found.length > 0) return found;
+    }
+
+    return [];
+  }, []);
+
   // ---- SKU lookup against dictionary ----
   const lookupSku = useCallback((sku) => {
     if (!sku || dictionary.length === 0) return null;
-    const skuUp = sku.toUpperCase().trim();
-    const match = dictionary.find(d => d.sku.toUpperCase() === skuUp);
-    if (match) return { ...match, matchType: "exacto" };
-    // Also try matching against skuVenta
-    const matchVenta = dictionary.find(d => (d.skuVenta || "").toUpperCase() === skuUp);
-    if (matchVenta) return { ...matchVenta, matchType: "exacto" };
+    const matches = fuzzyOcrMatch(sku, dictionary);
+    if (matches.length > 0) return { ...matches[0], matchType: matches[0].sku.toUpperCase() === sku.toUpperCase().trim() ? "exacto" : "ocr-fuzzy" };
     return null;
-  }, [dictionary]);
+  }, [dictionary, fuzzyOcrMatch]);
 
   const updateProduct = (idx, field, value) => {
     setExtractedProducts(prev => {
@@ -1136,7 +1176,7 @@ function App() {
       // If SKU is being edited, try to lookup in dictionary
       if (field === "sku") {
         const skuUp = (value || "").toUpperCase().trim();
-        const allMatches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+        const allMatches = fuzzyOcrMatch(skuUp, dictionary);
 
         if (allMatches.length > 1) {
           // Multiple variants — trigger selection modal
@@ -1291,8 +1331,8 @@ function App() {
       let matched = !!codigoML;
       
       if (!finalCodigoML && dictionary.length > 0) {
-        const skuUp = sku.toUpperCase();
-        const dictMatch = dictionary.find(d => d.sku.toUpperCase() === skuUp);
+        const fuzzyMatches = fuzzyOcrMatch(sku, dictionary);
+        const dictMatch = fuzzyMatches[0] || null;
         if (dictMatch) {
           finalCodigoML = dictMatch.codigoML;
           finalNombre = dictMatch.nombre || nombre;
@@ -1888,11 +1928,12 @@ function App() {
                       {p.etiquetaImpresa === false && <span style={{...styles.badgeWarning, background: "rgba(245,158,11,0.15)", color: "#F59E0B"}}>🚫 Sin etiqueta</span>}
                       {p.needsVariantSelection && <span style={{...styles.badgeWarning, background: "rgba(239,68,68,0.15)", color: "#EF4444", cursor: "pointer"}} onClick={() => setShowVariantModal(true)}>⚠ Elegir formato</span>}
                       {!p.matched && !p.needsVariantSelection && <span style={styles.badgeWarning}>Sin ML</span>}
+                      {p.matched && p.matchType === "ocr-fuzzy" && <span style={{...styles.badgeSuccess, background: "rgba(59,130,246,0.12)", color: "#3B82F6"}} title={"OCR corregido: " + (p.skuOriginal || "")}>🔧 Corregido</span>}
                       {p.matched && p.etiquetaImpresa !== false && <span style={styles.badgeSuccess}>✓ ML</span>}
                       {p.isPack && <span style={{...styles.badgeSuccess, background: "rgba(245,158,11,0.12)", color: "#F59E0B"}}>📦 Pack x{p.cantPack}</span>}
                       {p.altCount > 1 && !p.needsVariantSelection && <span style={{...styles.badgeSuccess, background: "rgba(139,92,246,0.12)", color: "#8B5CF6", cursor: "pointer"}} onClick={() => {
                         const skuUp = (p.sku || "").toUpperCase().trim();
-                        const matches = dictionary.filter(d => d.sku.toUpperCase() === skuUp);
+                        const matches = fuzzyOcrMatch(skuUp, dictionary);
                         if (matches.length > 1) {
                           setVariantSelections([{ productIdx: idx, sku: skuUp, matches, selected: null }]);
                           setShowVariantModal(true);
