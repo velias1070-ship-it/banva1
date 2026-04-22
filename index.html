@@ -777,14 +777,23 @@ function App() {
       });
 
       let data;
+      const rawText = await response.text().catch(() => "");
+
+      if (response.status === 504 || response.status === 502) {
+        throw new Error("El servidor tardó demasiado (timeout). Intenta con una imagen más pequeña o de mejor calidad.");
+      }
+      if (!rawText || !rawText.trim()) {
+        throw new Error("El servidor devolvió una respuesta vacía (status " + response.status + "). Intenta de nuevo.");
+      }
+
       try {
-        const rawText = await response.text();
         data = JSON.parse(rawText);
       } catch (parseErr) {
         if (parseErr.message.includes("EOF") || parseErr.message.includes("Unexpected end")) {
           throw new Error("La respuesta del servidor se cortó (timeout). Intenta con una imagen más pequeña o de mejor calidad.");
         }
-        throw new Error("El servidor no respondió correctamente. Intenta de nuevo.");
+        const preview = rawText.slice(0, 120).replace(/\s+/g, " ");
+        throw new Error("El servidor no respondió JSON válido (status " + response.status + "): " + preview);
       }
 
       if (data.error) {
