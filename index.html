@@ -125,7 +125,33 @@ function isWMSConfigured() {
   return WMS_CONFIG.SUPABASE_URL.length > 0 && WMS_CONFIG.SUPABASE_ANON_KEY.length > 0;
 }
 
-async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos) {
+// URL de banvabodega para el endpoint de resolución canónica de proveedores.
+// Si el endpoint falla o timeoutea, el flujo sigue con el proveedor "crudo".
+// Ver banvabodega/.claude/rules/supabase.md sección "Proveedor: esquema canónico (v72+)".
+const WMS_URL = "https://banvabodega.vercel.app";
+
+async function resolveProveedor(proveedor, rut) {
+  if (!proveedor && !rut) return { nombre_canonico: null, proveedor_id: null };
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(WMS_URL + "/api/proveedores/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rut: rut || undefined, razon_social: proveedor || undefined }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) throw new Error("status " + resp.status);
+    const data = await resp.json();
+    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null };
+  } catch (e) {
+    console.warn("[resolveProveedor] fallback con razon_social cruda:", e?.message || e);
+    return { nombre_canonico: proveedor, proveedor_id: null };
+  }
+}
+
+async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos, rut) {
   const sb = getWMSClient();
   if (!sb) throw new Error("WMS no configurado");
 
@@ -147,10 +173,15 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     } catch (e) { console.error("Image upload:", e); }
   }
 
+  // 1b. Resolver proveedor canónico (defensivo: si falla sigue con razon_social)
+  const { nombre_canonico, proveedor_id } = await resolveProveedor(proveedor, rut);
+  const proveedorFinal = nombre_canonico || proveedor || "Desconocido";
+
   // 2. Create recepcion
   const { data: rec, error: recErr } = await sb.from("recepciones").insert({
     folio: folio || "SIN_FOLIO",
-    proveedor: proveedor || "Desconocido",
+    proveedor: proveedorFinal,
+    proveedor_id: proveedor_id,
     imagen_url: imagenUrl,
     estado: "CREADA",
     costo_neto: costos?.costo_neto || 0,
