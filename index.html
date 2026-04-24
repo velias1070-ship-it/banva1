@@ -131,7 +131,7 @@ function isWMSConfigured() {
 const WMS_URL = "https://banvabodega.vercel.app";
 
 async function resolveProveedor(proveedor, rut) {
-  if (!proveedor && !rut) return { nombre_canonico: null, proveedor_id: null };
+  if (!proveedor && !rut) return { nombre_canonico: null, proveedor_id: null, fuente: "vacio" };
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -144,10 +144,40 @@ async function resolveProveedor(proveedor, rut) {
     clearTimeout(timeoutId);
     if (!resp.ok) throw new Error("status " + resp.status);
     const data = await resp.json();
-    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null };
+    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null, fuente: "resolve" };
   } catch (e) {
     console.warn("[resolveProveedor] fallback con razon_social cruda:", e?.message || e);
-    return { nombre_canonico: proveedor, proveedor_id: null };
+    return { nombre_canonico: proveedor, proveedor_id: null, fuente: "fallback" };
+  }
+}
+
+// Fallback para RAPIDO (sin factura, sin proveedor): inferir por los SKUs escaneados.
+// Llama /api/proveedores/inferir-por-skus. Si confidence alta, usa el resultado.
+// Si no alcanza threshold o falla, devuelve null → queda "Desconocido" como hoy.
+async function inferirProveedorPorSkus(skus) {
+  if (!skus || skus.length === 0) return null;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(WMS_URL + "/api/proveedores/inferir-por-skus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skus }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) throw new Error("status " + resp.status);
+    const data = await resp.json();
+    if (!data.proveedor_id) return null; // endpoint ya filtra por confidence
+    return {
+      nombre_canonico: data.nombre_canonico,
+      proveedor_id: data.proveedor_id,
+      confidence: data.confidence,
+      evidencia: data.evidencia,
+    };
+  } catch (e) {
+    console.warn("[inferirProveedorPorSkus] fallback:", e?.message || e);
+    return null;
   }
 }
 
@@ -174,7 +204,20 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
   }
 
   // 1b. Resolver proveedor canónico (defensivo: si falla sigue con razon_social)
-  const { nombre_canonico, proveedor_id } = await resolveProveedor(proveedor, rut);
+  let { nombre_canonico, proveedor_id, fuente } = await resolveProveedor(proveedor, rut);
+  let inferenciaInfo = null;
+
+  // 1c. Fallback RAPIDO: si no hay proveedor (ni via resolve ni crudo), inferir por SKUs
+  if (!proveedor_id && !proveedor) {
+    const skus = (productos || []).map(p => (p.sku || "").toUpperCase()).filter(Boolean);
+    const inferido = await inferirProveedorPorSkus(skus);
+    if (inferido) {
+      nombre_canonico = inferido.nombre_canonico;
+      proveedor_id = inferido.proveedor_id;
+      fuente = "inferido";
+      inferenciaInfo = inferido;
+    }
+  }
   const proveedorFinal = nombre_canonico || proveedor || "Desconocido";
 
   // 2. Create recepcion
@@ -223,7 +266,7 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     if (linErr) throw new Error("Error creando líneas: " + linErr.message);
   }
 
-  return { recId, lineas: lineas.length, imagenUrl };
+  return { recId, lineas: lineas.length, imagenUrl, proveedor: proveedorFinal, proveedor_id, fuenteProveedor: fuente, inferenciaInfo };
 }
 
 // ============================================================
@@ -945,12 +988,14 @@ function App() {
   }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators]);
 
   // ---- Send to WMS ----
+  const [wmsResult, setWmsResult] = useState(null);
   const sendToWMS = useCallback(async () => {
     if (!isWMSConfigured()) { setWmsError("WMS no configurado. Editar WMS_CONFIG en index.html"); setWmsStatus("error"); return; }
     setWmsStatus("sending"); setWmsError("");
     try {
       const costos = { costo_neto: costoNeto, iva, costo_bruto: costoBruto };
       const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos);
+      setWmsResult(result);
       setWmsStatus("sent");
     } catch (err) {
       setWmsError(err.message);
@@ -2126,6 +2171,19 @@ function App() {
                 {wmsStatus === "sent" && (
                   <div style={{padding: "10px 14px", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 8, textAlign: "center"}}>
                     <div style={{color: "#22C55E", fontWeight: 700, fontSize: 13}}>✅ Recepción creada en WMS</div>
+                    {wmsResult && wmsResult.proveedor && (
+                      <div style={{color: "#ccc", fontSize: 11, marginTop: 4}}>
+                        Proveedor: <strong>{wmsResult.proveedor}</strong>
+                        {wmsResult.fuenteProveedor === "inferido" && wmsResult.inferenciaInfo && (
+                          <span style={{color: "#3B82F6", marginLeft: 4}}>
+                            💡 detectado por SKUs ({Math.round((wmsResult.inferenciaInfo.confidence || 0) * 100)}%)
+                          </span>
+                        )}
+                        {wmsResult.fuenteProveedor === "fallback" && (
+                          <span style={{color: "#F59E0B", marginLeft: 4}}>⚠ sin FK (endpoint no disponible)</span>
+                        )}
+                      </div>
+                    )}
                     <div style={{color: "#888", fontSize: 11, marginTop: 2}}>El operario ya puede verla en la app de bodega</div>
                   </div>
                 )}
