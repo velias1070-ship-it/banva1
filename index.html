@@ -639,12 +639,25 @@ function App() {
     }
   }, [parseCSV]);
 
-  // Default Google Sheet URL (loads on all devices automatically)
-  const DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQZxKcXM-OaJ5_B-lEM87PPy9B4675FRFLfpWtL-ZhTqpalZNqODq18XFY2C4txj7fXc5n1jYZSTWrJ/pub?gid=348421726&single=true&output=csv";
+  // Default dictionary endpoint — ahora servido desde banvabodega (antes era
+  // un Google Sheet publicado). El endpoint devuelve CSV con el mismo formato
+  // que el Sheet original, parseable por parseCSV() sin cambios.
+  const DEFAULT_SHEET_URL = "https://banvabodega.vercel.app/api/admin/diccionario.csv";
 
-  // Load dictionary: always fetch from Sheet
+  // URL legacy del Google Sheet (deprecated). Si algun usuario tiene esta URL
+  // guardada en localStorage, se migra automaticamente al endpoint nuevo en el
+  // siguiente load. El Sheet quedara despublicado en algun momento.
+  const LEGACY_SHEET_URL_PATTERN = /docs\.google\.com\/spreadsheets\/.*pub.*output=csv/;
+
+  // Load dictionary: always fetch from configured URL
   useEffect(() => {
-    const url = localStorage.getItem("banva_sheet_url") || DEFAULT_SHEET_URL;
+    let url = localStorage.getItem("banva_sheet_url") || DEFAULT_SHEET_URL;
+    // Auto-migrar si tiene la URL legacy del Sheet
+    if (LEGACY_SHEET_URL_PATTERN.test(url)) {
+      console.log("[banva1] Migrando URL del Google Sheet (deprecated) → endpoint banvabodega");
+      url = DEFAULT_SHEET_URL;
+      localStorage.setItem("banva_sheet_url", url);
+    }
     setSheetUrl(url);
     fetchFromSheet(url);
   }, []);
