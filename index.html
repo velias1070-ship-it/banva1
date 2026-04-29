@@ -1510,12 +1510,15 @@ function App() {
       for (const vs of variantSelections) {
         const idx = vs.productIdx;
         if (vs.selected === "no_label") {
-          // User chose not to label this product
+          // User chose not to label this product — don't commit to any specific
+          // variant. Leave skuVenta empty so banvabodega doesn't infer a pack
+          // from composicion_venta (e.g. paint a "PACK x2" badge on stock that
+          // could go out as either pack or unit).
           next[idx] = {
             ...next[idx],
             codigoML: "",
-            nombreDict: vs.matches[0]?.nombre || next[idx].nombre || "",
-            skuVenta: vs.matches[0]?.skuVenta || "",
+            nombreDict: next[idx].nombre || "",
+            skuVenta: "",
             matched: true,
             matchType: "sin_etiqueta",
             needsVariantSelection: false,
