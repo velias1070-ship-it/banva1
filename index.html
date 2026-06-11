@@ -270,6 +270,22 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
 }
 
 // ============================================================
+// Busqueda por palabras (sin tildes, sin orden): "toalla beige"
+// matchea "Set 4 Toallas Illusions Beige". Mismo criterio que el
+// buscador de banvabodega (src/lib/busqueda.ts).
+// ============================================================
+function normBusqueda(s) {
+  const base = (s || "").toLowerCase();
+  try { return base.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); } catch (e) { return base; }
+}
+function matchesBusqueda(campos, busqueda) {
+  const q = normBusqueda(busqueda).trim();
+  if (!q) return true;
+  const blob = campos.map(normBusqueda).join(" ");
+  return q.split(/\s+/).every(t => blob.includes(t));
+}
+
+// ============================================================
 // Category extractor from product name
 // ============================================================
 function extractCategory(nombre) {
@@ -1343,12 +1359,8 @@ function App() {
   // ---- Quick Mode: search & generate labels without photo ----
   const quickSearchResults = React.useMemo(() => {
     if (!quickSearch || quickSearch.length < 2 || dictionary.length === 0) return [];
-    const q = quickSearch.toUpperCase();
-    return dictionary.filter(d => 
-      d.sku.toUpperCase().includes(q) || 
-      (d.skuVenta || "").toUpperCase().includes(q) ||
-      (d.nombre || "").toUpperCase().includes(q) ||
-      (d.codigoML || "").toUpperCase().includes(q)
+    return dictionary.filter(d =>
+      matchesBusqueda([d.sku, d.skuVenta, d.nombre, d.codigoML], quickSearch)
     ).slice(0, 10);
   }, [quickSearch, dictionary]);
 
@@ -1484,12 +1496,8 @@ function App() {
   // Inline product search results (for unmatched products)
   const productSearchResults = React.useMemo(() => {
     if (!productSearchQuery || productSearchQuery.length < 2 || dictionary.length === 0) return [];
-    const q = productSearchQuery.toUpperCase();
-    return dictionary.filter(d => 
-      d.sku.toUpperCase().includes(q) || 
-      (d.skuVenta || "").toUpperCase().includes(q) ||
-      (d.nombre || "").toUpperCase().includes(q) ||
-      (d.codigoML || "").toUpperCase().includes(q)
+    return dictionary.filter(d =>
+      matchesBusqueda([d.sku, d.skuVenta, d.nombre, d.codigoML], productSearchQuery)
     ).slice(0, 6);
   }, [productSearchQuery, dictionary]);
 
