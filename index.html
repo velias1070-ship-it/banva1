@@ -522,6 +522,7 @@ function App() {
   const [costoNeto, setCostoNeto] = useState(0);
   const [iva, setIva] = useState(0);
   const [costoBruto, setCostoBruto] = useState(0);
+  const [lastCosts, setLastCosts] = useState({}); // sku(upper) -> {costo, fecha} última recepción
   const [dictionary, setDictionary] = useState([]);
   const [hasDictionary, setHasDictionary] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -1032,9 +1033,24 @@ function App() {
       setWmsStatus("error");
       return;
     }
+    // Sin costos no se puede recibir al WMS: escribiría costo_unitario 0 y corrompe el
+    // WAC/costo_promedio en banvabodega. Los folios RAPIDO/LISTA saltan la captura de costo
+    // (sumaLineas=0) y el cuadre de arriba está gateado en netoCab>0, así que no los protege.
+    // Las etiquetas ya se imprimieron; acá solo se bloquea el envío de la recepción.
+    if (sumaLineas <= 0) {
+      setWmsError("Esta recepción no tiene costos cargados (modo rápido / lista). Para registrarla en el WMS subí la factura por OCR, o cargá los costos por línea en \"Editar\". Las etiquetas ya están listas igual.");
+      setWmsStatus("error");
+      return;
+    }
     setWmsStatus("sending"); setWmsError("");
     try {
-      const costos = { costo_neto: costoNeto, iva, costo_bruto: costoBruto };
+      // Sin factura (RAPIDO/LISTA) no hay cabecera de costos: usamos la suma de líneas
+      // (costo neto unitario × cantidad). IVA no se captura, así que bruto = neto (no inferimos 19%).
+      // Con factura se respeta neto/iva/bruto del OCR.
+      const conFactura = (Number(costoNeto) || 0) > 0;
+      const costos = conFactura
+        ? { costo_neto: costoNeto, iva, costo_bruto: costoBruto }
+        : { costo_neto: sumaLineas, iva: 0, costo_bruto: sumaLineas };
       const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos);
       setWmsResult(result);
       setWmsStatus("sent");
@@ -1043,6 +1059,40 @@ function App() {
       setWmsStatus("error");
     }
   }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto]);
+
+  // ---- Último costo conocido por SKU (de la última recepción) ----
+  // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
+  // operario decide si lo usa. La anon key puede leer por policy allow_select_recepcion_lineas.
+  const fetchLastCosts = useCallback(async (skus) => {
+    const sb = getWMSClient();
+    const ups = [...new Set((skus || []).map(s => (s || "").toUpperCase().trim()).filter(Boolean))];
+    if (!sb || ups.length === 0) return;
+    try {
+      const { data, error } = await sb
+        .from("recepcion_lineas")
+        .select("sku, costo_unitario, recepciones(created_at)")
+        .in("sku", ups)
+        .gt("costo_unitario", 0)
+        .limit(2000);
+      if (error || !data) return;
+      data.sort((a, b) => new Date(b.recepciones?.created_at || 0) - new Date(a.recepciones?.created_at || 0));
+      const map = {};
+      for (const row of data) {
+        const sku = (row.sku || "").toUpperCase();
+        if (!map[sku]) map[sku] = { costo: Number(row.costo_unitario), fecha: row.recepciones?.created_at || null };
+      }
+      setLastCosts(map);
+    } catch (_) { /* sugerencia best-effort: si falla, no pasa nada */ }
+  }, []);
+
+  // Al entrar a "Revisar/Editar" buscamos el último costo de cada SKU como sugerencia.
+  // Depende de la firma de SKUs (no del array completo) para no re-consultar en cada tecla de costo.
+  const skuSig = extractedProducts.map(p => (p.sku || "").toUpperCase()).join(",");
+  useEffect(() => {
+    if (step === "review" && isWMSConfigured() && skuSig) {
+      fetchLastCosts(skuSig.split(",").filter(Boolean));
+    }
+  }, [step, skuSig, fetchLastCosts]);
 
   // ---- Download Labels PDF ----
   const downloadLabelsPDF = useCallback(async () => {
@@ -2184,14 +2234,30 @@ function App() {
                       />
                     </div>
                     <div style={styles.fieldGroup}>
-                      <label style={styles.fieldLabel}>Costo</label>
+                      <label style={styles.fieldLabel}>Costo neto/u</label>
                       <input
                         style={styles.fieldInput}
                         type="number"
                         value={p.costo || ""}
                         onChange={(e) => updateProduct(idx, "costo", e.target.value)}
                         min="0"
+                        placeholder="$ por unidad"
                       />
+                      {Number(p.costo) > 0 && Number(p.cantidad) > 0 && (
+                        <div style={{fontSize: 10, color: "#888", marginTop: 3}}>
+                          × {p.cantidad} = ${Math.round(Number(p.costo) * Number(p.cantidad)).toLocaleString("es-CL")} neto
+                        </div>
+                      )}
+                      {lastCosts[(p.sku || "").toUpperCase()] && (
+                        <div
+                          style={{fontSize: 10, color: "#3B82F6", marginTop: 3, cursor: "pointer"}}
+                          title="Usar este costo"
+                          onClick={() => updateProduct(idx, "costo", lastCosts[(p.sku || "").toUpperCase()].costo)}
+                        >
+                          ↩ Última recep.: ${Math.round(lastCosts[(p.sku || "").toUpperCase()].costo).toLocaleString("es-CL")}
+                          {lastCosts[(p.sku || "").toUpperCase()].fecha ? ` (${new Date(lastCosts[(p.sku || "").toUpperCase()].fecha).toLocaleDateString("es-CL", {day: "2-digit", month: "2-digit", year: "2-digit"})})` : ""} — usar
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -2228,16 +2294,26 @@ function App() {
               <div style={{marginTop: 10}}>
                 {wmsStatus === "" && (() => {
                   const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
+                  const totalUds = extractedProducts.reduce((s, p) => s + (Number(p.cantidad) || 0), 0);
                   const netoCab = Number(costoNeto) || 0;
-                  const blocked = netoCab > 0 && Math.abs(sumaLineas - netoCab) > 100;
+                  const sinCostos = sumaLineas <= 0;
+                  const desfase = netoCab > 0 && Math.abs(sumaLineas - netoCab) > 100;
+                  const blocked = sinCostos || desfase;
+                  const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
                   return (
-                    <button
-                      onClick={sendToWMS}
-                      disabled={blocked}
-                      style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: blocked ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: blocked ? "#666" : "#fff", fontSize: 14, fontWeight: 700, border: blocked ? "1px solid #333" : "none", cursor: blocked ? "not-allowed" : "pointer", opacity: blocked ? 0.7 : 1}}
-                    >
-                      {blocked ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
-                    </button>
+                    <>
+                      <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", marginBottom: 8, background: "#141416", borderRadius: 10, border: "1px solid #2A2A30", fontSize: 13}}>
+                        <span style={{color: "#888"}}>Total recepción (neto) · {totalUds} uds</span>
+                        <span style={{color: sinCostos ? "#666" : "#22C55E", fontWeight: 700}}>{sinCostos ? "— cargá costos" : fmt(sumaLineas)}</span>
+                      </div>
+                      <button
+                        onClick={sendToWMS}
+                        disabled={blocked}
+                        style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: blocked ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: blocked ? "#666" : "#fff", fontSize: 14, fontWeight: 700, border: blocked ? "1px solid #333" : "none", cursor: blocked ? "not-allowed" : "pointer", opacity: blocked ? 0.7 : 1}}
+                      >
+                        {sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
+                      </button>
+                    </>
                   );
                 })()}
                 {wmsStatus === "sending" && (
@@ -2304,14 +2380,19 @@ function App() {
                   <div style={{padding: "10px 14px", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 8, textAlign: "center"}}>
                     <span style={{color: "#22C55E", fontWeight: 700, fontSize: 12}}>✅ Recepción enviada al WMS</span>
                   </div>
-                ) : (
+                ) : (() => {
+                  const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
+                  const sinCostos = sumaLineas <= 0;
+                  const dis = wmsStatus === "sending" || sinCostos;
+                  return (
                   <button
-                    onClick={sendToWMS} disabled={wmsStatus === "sending"}
-                    style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: wmsStatus === "sending" ? "#333" : "linear-gradient(135deg, #10b981, #059669)", color: "#fff", fontSize: 13, fontWeight: 700, border: "none", cursor: wmsStatus === "sending" ? "default" : "pointer"}}
+                    onClick={sendToWMS} disabled={dis}
+                    style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: dis ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: dis ? "#666" : "#fff", fontSize: 13, fontWeight: 700, border: dis ? "1px solid #333" : "none", cursor: dis ? "not-allowed" : "pointer"}}
                   >
-                    {wmsStatus === "sending" ? "⏳ Enviando..." : "📦 Enviar recepción al WMS"}
+                    {wmsStatus === "sending" ? "⏳ Enviando..." : sinCostos ? "🚫 Sin costos — andá a \"Editar\" para cargarlos" : "📦 Enviar recepción al WMS"}
                   </button>
-                )}
+                  );
+                })()}
                 {wmsStatus === "error" && (
                   <div style={{marginTop: 4, color: "#EF4444", fontSize: 11, textAlign: "center"}}>{wmsError}</div>
                 )}
