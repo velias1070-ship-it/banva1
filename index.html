@@ -2069,7 +2069,11 @@ function App() {
             {(() => {
               const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
               const netoCab = Number(costoNeto) || 0;
-              if (netoCab === 0 && sumaLineas === 0) return null;
+              // El cuadre solo aplica cuando hay factura (neto de cabecera contra qué comparar).
+              // Sin factura (recepción manual RAPIDO/LISTA) no hay nada que cuadrar: el total
+              // se muestra en el bloque de envío al WMS. No mostramos esta tarjeta.
+              // <=0 (no solo ===0) para reflejar exactamente el gate del botón (netoCab>0).
+              if (netoCab <= 0) return null;
               const diff = sumaLineas - netoCab;
               const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
               const hasIssue = Math.abs(diff) > 100;
