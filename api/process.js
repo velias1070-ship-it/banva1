@@ -125,33 +125,50 @@ REGLAS:
 Responde SOLO JSON válido:
 {"folio":"","proveedor":"","costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta"}]}`;
 
-  const requestBody = JSON.stringify({
-    model: "claude-sonnet-4-6",
-    max_tokens: 3000,
-    system: systemPrompt,
-    messages: [{
-      role: "user",
-      content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
-    }]
-  });
+  // Modelos en orden de preferencia. Si Anthropic retira el primero
+  // (404 not_found_error), cae automaticamente al siguiente y la app NO se cae.
+  // Esto evita que un modelo retirado vuelva a romper el procesamiento de facturas.
+  const MODELOS = ["claude-sonnet-4-6", "claude-opus-4-8"];
 
-  const response = await fetchWithTimeout(
-    "https://api.anthropic.com/v1/messages",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01"
+  let response = null;
+  let ultimoError = "";
+  for (const modelo of MODELOS) {
+    const requestBody = JSON.stringify({
+      model: modelo,
+      max_tokens: 3000,
+      system: systemPrompt,
+      messages: [{
+        role: "user",
+        content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
+      }]
+    });
+
+    const r = await fetchWithTimeout(
+      "https://api.anthropic.com/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01"
+        },
+        body: requestBody
       },
-      body: requestBody
-    },
-    35000
-  );
+      35000
+    );
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error("Claude API error: " + response.status + " - " + err.slice(0, 300));
+    if (r.ok) { response = r; break; }
+
+    const err = await r.text();
+    ultimoError = "Claude API error: " + r.status + " - " + err.slice(0, 300);
+    // Solo probamos el siguiente modelo si ESTE fue "modelo no encontrado"
+    // (retirado o typo). Cualquier otro error (rate limit, key, etc.) corta aqui.
+    const modeloRetirado = r.status === 404 && err.includes("not_found_error");
+    if (!modeloRetirado) throw new Error(ultimoError);
+  }
+
+  if (!response) {
+    throw new Error(ultimoError || "Claude API: ningun modelo disponible");
   }
 
   const data = await response.json();
