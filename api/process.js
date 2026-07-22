@@ -10,7 +10,13 @@ const VISION_ERRORS = {
   413: "Imagen demasiado grande para Google Vision (máx ~10MB en base64).",
 };
 
-async function fetchWithTimeout(url, options, timeoutMs = 30000) {
+// `etapa` identifica cual de las dos llamadas externas se colgo (OCR o extraccion).
+// Antes el mensaje era generico y mandaba al operador a achicar la foto, aunque
+// el que se hubiera cortado fuera Claude — donde el tamano de la imagen no influye
+// en nada. Perdiamos el diagnostico y el operador reintentaba mal.
+// `consejo` es la accion util para ESA etapa. En el OCR sigue valiendo "saca la
+// foto de nuevo"; en la extraccion no, porque ahi la imagen ya ni existe.
+async function fetchWithTimeout(url, options, timeoutMs = 30000, etapa = "la solicitud", consejo = "") {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -18,7 +24,15 @@ async function fetchWithTimeout(url, options, timeoutMs = 30000) {
     return response;
   } catch (err) {
     if (err.name === "AbortError") {
-      throw new Error("La solicitud tardó demasiado (timeout). Intenta con una imagen más pequeña.");
+      const seg = Math.round(timeoutMs / 1000);
+      const timeoutErr = new Error(
+        `Se cortó ${etapa} por tiempo (${seg}s). ${consejo} `.trim() +
+        ` Si se repite, avisa indicando el folio de la factura.`
+      );
+      // Marca explicita: el retry de Vision decide con esto, NO con includes("timeout").
+      // Si alguien vuelve a editar el texto del mensaje, el reintento sigue funcionando.
+      timeoutErr.esTimeout = true;
+      throw timeoutErr;
     }
     throw err;
   } finally {
@@ -26,9 +40,33 @@ async function fetchWithTimeout(url, options, timeoutMs = 30000) {
   }
 }
 
+// Vercel corta la funcion a los 300s (vercel.json). Si la SUMA de los timeouts
+// individuales se pasa de ahi, Vercel mata el proceso y el operador ve el mensaje
+// generico del frontend ("intenta con una imagen mas pequena") en vez del nuestro
+// — justo lo que este cambio quiere eliminar. Peor caso teorico sin este tope:
+// OCR 60s x2 + backoff (121s) + Claude 120s + reintento sin tuning 120s = 361s.
+// Por eso cada llamada se recorta a lo que quede del presupuesto global.
+const PRESUPUESTO_MS = 240000; // 240s: deja 60s de colchon bajo el maxDuration de 300s
+
+function segunPresupuesto(ms, finPresupuesto) {
+  const restante = finPresupuesto - Date.now();
+  // Si ya no queda presupuesto, cortamos aca en vez de lanzar otra llamada
+  // condenada: asi el operador ve NUESTRO mensaje y no el 504 pelado de Vercel
+  // (que el frontend traduce al viejo "intenta con una imagen mas pequena").
+  if (restante <= 5000) {
+    const err = new Error(
+      "Se acabó el tiempo disponible para procesar la factura. " +
+      "Vuelve a intentar; si se repite, avisa indicando el folio."
+    );
+    err.esTimeout = true;
+    throw err;
+  }
+  return Math.min(ms, restante);
+}
+
 // --- Google Cloud Vision OCR ---
 
-async function ocrWithVision(imageBase64, apiKey, retries = 1) {
+async function ocrWithVision(imageBase64, apiKey, finPresupuesto, retries = 1) {
   const payload = JSON.stringify({
     requests: [{
       image: { content: imageBase64 },
@@ -51,7 +89,12 @@ async function ocrWithVision(imageBase64, apiKey, retries = 1) {
           headers: { "Content-Type": "application/json" },
           body: payload
         },
-        20000
+        // 60s (antes 20s). La funcion tiene maxDuration 300s, asi que el techo
+        // corto era nuestro, no de Vercel: facturas densas o fotos de varias
+        // paginas apiladas hacen que Vision demore mas de 20s y se cortaba sola.
+        segunPresupuesto(60000, finPresupuesto),
+        "el OCR de la factura",
+        "Saca la foto de nuevo, mejor iluminada y sin sombras."
       );
 
       if (!response.ok) {
@@ -90,7 +133,7 @@ async function ocrWithVision(imageBase64, apiKey, retries = 1) {
 
     } catch (err) {
       lastError = err;
-      const isRetryable = err.message.includes("timeout") ||
+      const isRetryable = err.esTimeout ||
                           err.message.includes("fetch failed") ||
                           err.message.includes("ECONNRESET") ||
                           err.message.includes("429");
@@ -106,7 +149,7 @@ async function ocrWithVision(imageBase64, apiKey, retries = 1) {
 
 // --- Claude Sonnet: structure OCR text into invoice data ---
 
-async function structureWithClaude(ocrText, anthropicKey) {
+async function structureWithClaude(ocrText, anthropicKey, finPresupuesto) {
   const truncatedOcr = ocrText.length > 6000 ? ocrText.slice(0, 6000) : ocrText;
 
   const systemPrompt = `Eres un sistema de extracción de datos de facturas chilenas. Recibes texto OCR de una factura y extraes los productos.
@@ -122,7 +165,8 @@ REGLAS:
 - NO inventes productos ni SKUs. Si algo es ilegible, omítelo
 - Cada fila de la tabla es un producto SEPARADO
 
-Responde SOLO JSON válido:
+Responde SOLO JSON válido, COMPACTO: todo en una sola línea, sin saltos de línea,
+sin indentación y sin espacios entre campos. Nada de texto antes ni después del JSON.
 {"folio":"","proveedor":"","costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta"}]}`;
 
   // Modelos en orden de preferencia. Si Anthropic retira el primero
@@ -130,32 +174,52 @@ Responde SOLO JSON válido:
   // Esto evita que un modelo retirado vuelva a romper el procesamiento de facturas.
   const MODELOS = ["claude-sonnet-4-6", "claude-opus-4-8"];
 
+  // DESCARTADO a proposito: output_config {effort:"low"}. Recortaba algo de
+  // latencia, pero dos revisiones independientes marcaron el mismo riesgo: menos
+  // deliberacion en una extraccion sobre OCR puede hacer que el modelo OMITA una
+  // linea legible y devuelva un JSON valido y completo. Eso no entra como error,
+  // entra como recepcion incompleta — el peor modo de fallo posible para el WMS.
+  // La ganancia era marginal; el riesgo, silencioso. No vale el cambio.
+  // (Tampoco thinking:{type:"disabled"}: en sonnet-4-6 y opus-4-8 omitir el campo
+  // ya significa sin thinking, seria un no-op puro.)
+  const armarBody = (modelo) => JSON.stringify({
+    model: modelo,
+    // 8000 (antes 3000). Medido contra prod: el modelo emite el JSON indentado
+    // (~179 chars por producto), asi que una factura de 40 lineas necesitaba
+    // ~3.140 tokens y se cortaba en el producto 38 de 40. El array quedaba sin
+    // cerrar y reventaba en JSON.parse. 3000 era el techo real de la app: ~38
+    // productos. Con el JSON compacto que ahora pedimos en el prompt sobra, pero
+    // dejamos aire para facturas grandes aunque el modelo ignore el "compacto".
+    max_tokens: 8000,
+    system: systemPrompt,
+    messages: [{
+      role: "user",
+      content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
+    }]
+  });
+
+  const pedirAClaude = (modelo) => fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": anthropicKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: armarBody(modelo)
+    },
+    // 120s (antes 35s). Este paso NO tiene reintento por timeout: si se corta,
+    // se cae la factura entera. Con maxDuration 300s sobra techo, damos aire real.
+    segunPresupuesto(120000, finPresupuesto),
+    "la extracción de los productos",
+    "Vuelve a intentar: acá el tamaño de la foto no influye."
+  );
+
   let response = null;
   let ultimoError = "";
   for (const modelo of MODELOS) {
-    const requestBody = JSON.stringify({
-      model: modelo,
-      max_tokens: 3000,
-      system: systemPrompt,
-      messages: [{
-        role: "user",
-        content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
-      }]
-    });
-
-    const r = await fetchWithTimeout(
-      "https://api.anthropic.com/v1/messages",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": anthropicKey,
-          "anthropic-version": "2023-06-01"
-        },
-        body: requestBody
-      },
-      35000
-    );
+    const r = await pedirAClaude(modelo);
 
     if (r.ok) { response = r; break; }
 
@@ -172,6 +236,28 @@ Responde SOLO JSON válido:
   }
 
   const data = await response.json();
+
+  // Si el modelo se quedo sin cupo, el JSON viene cortado a la mitad. Hay que
+  // frenar ACA: el regex de abajo es greedy y "rescataria" hasta el ultimo
+  // producto completo, devolviendo una lista incompleta que parece valida.
+  // Una recepcion con productos faltantes es peor que una recepcion fallida.
+  // Los modelos Claude 4+ pueden declinar una peticion. Sin esto, `content`
+  // vendria vacio y el operador veria "Claude no devolvió JSON válido", que no
+  // le dice nada. Falla cerrada igual, pero con un mensaje que se entiende.
+  if (data.stop_reason === "refusal") {
+    throw new Error(
+      "La IA rechazó procesar esta imagen. Verifica que sea una factura y vuelve a intentar; " +
+      "si se repite, avisa indicando el folio."
+    );
+  }
+
+  if (data.stop_reason === "max_tokens") {
+    throw new Error(
+      "La factura tiene demasiados productos para procesarla de una vez: la respuesta " +
+      "se cortó por la mitad. NO uses el resultado parcial. Avisa con el folio de la factura."
+    );
+  }
+
   const text = data.content?.[0]?.text || "";
 
   // Extract JSON from response (handle potential markdown wrapping)
@@ -180,7 +266,17 @@ Responde SOLO JSON válido:
     throw new Error("Claude no devolvió JSON válido");
   }
 
-  return JSON.parse(jsonMatch[0]);
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch (parseErr) {
+    // Antes esto salia como un SyntaxError crudo ("Expected ',' or ']' after
+    // array element in JSON at position 6834"), que al operador no le dice nada.
+    console.error("JSON malformado de Claude:", parseErr.message, "| largo:", text.length);
+    throw new Error(
+      "La respuesta de la IA llegó incompleta o malformada. Reintenta; " +
+      "si vuelve a pasar, avisa con el folio de la factura."
+    );
+  }
 }
 
 // --- Handler ---
@@ -230,15 +326,19 @@ async function handler(req, res) {
         });
       }
 
+      // Presupuesto unico para toda la invocacion: ninguna llamada externa puede
+      // hacer que la suma se pase del maxDuration y Vercel nos mate el proceso.
+      const finPresupuesto = Date.now() + PRESUPUESTO_MS;
+
       // Step 1: OCR with Google Cloud Vision
       console.log("Step 1: Running Google Cloud Vision OCR...");
-      const ocrText = await ocrWithVision(body.imageBase64, visionKey);
+      const ocrText = await ocrWithVision(body.imageBase64, visionKey, finPresupuesto);
       console.log("OCR text length:", ocrText.length);
       console.log("OCR text preview:", ocrText.slice(0, 500));
 
       // Step 2: Structure with Claude Sonnet
       console.log("Step 2: Structuring with Claude Sonnet...");
-      const parsed = await structureWithClaude(ocrText, anthropicKey);
+      const parsed = await structureWithClaude(ocrText, anthropicKey, finPresupuesto);
       console.log("Claude extracted", parsed.productos?.length || 0, "products");
 
       return res.status(200).json({
