@@ -150,7 +150,14 @@ async function ocrWithVision(imageBase64, apiKey, finPresupuesto, retries = 1) {
 // --- Claude Sonnet: structure OCR text into invoice data ---
 
 async function structureWithClaude(ocrText, anthropicKey, finPresupuesto) {
-  const truncatedOcr = ocrText.length > 6000 ? ocrText.slice(0, 6000) : ocrText;
+  // ELIMINADO a proposito: aca habia un corte del OCR a 6.000 caracteres,
+  // resto de cuando esto corria en un modelo chico con max_tokens 4000.
+  // Cortaba LA COLA de la factura — los ultimos productos Y los totales — sin
+  // avisar, desde ~67 lineas (Idetex) o ~47 (proveedores con descripciones
+  // largas). Y al botar los totales dejaba costo_neto=0, lo que ademas apagaba
+  // el cuadre del frontend: recepcion incompleta que parecia completa.
+  // El modelo actual acepta 1M de tokens de contexto: una factura de 1.000
+  // lineas usa ~2% de eso. No hay nada que racionar. NO reintroducir el corte.
 
   const systemPrompt = `Eres un sistema de extracción de datos de facturas chilenas. Recibes texto OCR de una factura y extraes los productos.
 
@@ -194,7 +201,7 @@ sin indentación y sin espacios entre campos. Nada de texto antes ni después de
     system: systemPrompt,
     messages: [{
       role: "user",
-      content: "Extrae los productos de esta factura:\n\n" + truncatedOcr
+      content: "Extrae los productos de esta factura:\n\n" + ocrText
     }]
   });
 
@@ -237,10 +244,6 @@ sin indentación y sin espacios entre campos. Nada de texto antes ni después de
 
   const data = await response.json();
 
-  // Si el modelo se quedo sin cupo, el JSON viene cortado a la mitad. Hay que
-  // frenar ACA: el regex de abajo es greedy y "rescataria" hasta el ultimo
-  // producto completo, devolviendo una lista incompleta que parece valida.
-  // Una recepcion con productos faltantes es peor que una recepcion fallida.
   // Los modelos Claude 4+ pueden declinar una peticion. Sin esto, `content`
   // vendria vacio y el operador veria "Claude no devolvió JSON válido", que no
   // le dice nada. Falla cerrada igual, pero con un mensaje que se entiende.
@@ -251,6 +254,12 @@ sin indentación y sin espacios entre campos. Nada de texto antes ni después de
     );
   }
 
+  // Si el modelo se quedo sin cupo, el JSON viene cortado a la mitad. Como
+  // "productos" es la ULTIMA clave del schema, el corte siempre cae dentro del
+  // array: al JSON le falta el cierre y el JSON.parse de abajo reventaria solo
+  // (no existe el caso "lista incompleta que parsea bien"). Este guard no evita
+  // eso — lo que hace es reemplazar el SyntaxError criptico por un mensaje que
+  // el operador entiende y que le prohibe explicitamente usar el parcial.
   if (data.stop_reason === "max_tokens") {
     throw new Error(
       "La factura tiene demasiados productos para procesarla de una vez: la respuesta " +

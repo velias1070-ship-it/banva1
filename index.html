@@ -522,6 +522,13 @@ function App() {
   const [costoNeto, setCostoNeto] = useState(0);
   const [iva, setIva] = useState(0);
   const [costoBruto, setCostoBruto] = useState(0);
+  // El OCR proceso una factura pero NO logro leer el total (tipico: foto que no
+  // incluye la parte de abajo, donde estan los totales... y tambien los ultimos
+  // productos). En ese caso el cuadre no tiene contra que comparar y se apagaba
+  // solo — asi entraron 22 recepciones mal clasificadas (feb-jul 2026, ej. folio
+  // 535410). Con esta marca la tarjeta de cuadre pide el neto A MANO y el envio
+  // al WMS queda bloqueado hasta que el operador lo escriba.
+  const [netoManual, setNetoManual] = useState(false);
   const [lastCosts, setLastCosts] = useState({}); // sku(upper) -> {costo, fecha} última recepción
   const [dictionary, setDictionary] = useState([]);
   const [hasDictionary, setHasDictionary] = useState(false);
@@ -923,6 +930,9 @@ function App() {
       setCostoNeto(parsed.costo_neto || 0);
       setIva(parsed.iva || 0);
       setCostoBruto(parsed.costo_bruto || 0);
+      // Total no leido = señal de foto cortada abajo o de OCR incompleto.
+      // Se pide a mano en la tarjeta de cuadre; el envio queda bloqueado hasta ahi.
+      setNetoManual(!(Number(parsed.costo_neto) > 0));
       setWmsStatus(""); setWmsError("");
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
@@ -1026,6 +1036,23 @@ function App() {
     // que el operario edite antes de corromper costo_promedio en banvabodega.
     const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
     const netoCab = Number(costoNeto) || 0;
+    // Origen real de la recepcion. La marca fiable es el folio que estampan los
+    // flujos manuales (RAPIDO/LISTA) + la existencia de foto. costoNeto>0 NO
+    // sirve como discriminador: una factura cuyo total no se leyo (foto cortada
+    // abajo, ej. folio 535410) quedaba clasificada como recepcion manual y
+    // ademas apagaba el cuadre — asi entraron 22 recepciones con iva=0 entre
+    // feb y jul 2026.
+    const esFlujoManual = folioFactura === "RAPIDO" || folioFactura === "LISTA";
+    const conFactura = !!invoiceImage && !esFlujoManual;
+    // Con factura, el neto de cabecera es OBLIGATORIO: es lo unico que permite
+    // detectar productos faltantes (la parte de abajo de la factura trae los
+    // totales Y las ultimas lineas — si se perdio una cosa, se perdio la otra).
+    // Sin neto no hay cuadre, y sin cuadre una lista incompleta entra callada.
+    if (conFactura && netoCab <= 0) {
+      setWmsError("No se leyó el total de la factura (¿la foto incluye la parte de abajo?). Escribí el NETO impreso en la tarjeta amarilla del paso \"Editar\" — sin él no se puede verificar que no falten productos.");
+      setWmsStatus("error");
+      return;
+    }
     const diffNeto = sumaLineas - netoCab;
     if (netoCab > 0 && Math.abs(diffNeto) > 100) {
       const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
@@ -1044,13 +1071,28 @@ function App() {
     }
     setWmsStatus("sending"); setWmsError("");
     try {
-      // Sin factura (RAPIDO/LISTA) no hay cabecera de costos: usamos la suma de líneas
-      // (costo neto unitario × cantidad). IVA no se captura, así que bruto = neto (no inferimos 19%).
-      // Con factura se respeta neto/iva/bruto del OCR.
-      const conFactura = (Number(costoNeto) || 0) > 0;
-      const costos = conFactura
-        ? { costo_neto: costoNeto, iva, costo_bruto: costoBruto }
-        : { costo_neto: sumaLineas, iva: 0, costo_bruto: sumaLineas };
+      // Tres reglas de cabecera, según qué tan confiable es cada dato:
+      // 1. Sin factura (RAPIDO/LISTA): suma de líneas, sin IVA (no inferimos 19%).
+      // 2. Neto tipeado a mano (netoManual): la parte de abajo de la factura NO se
+      //    leyó — o se leyó a medias, y un iva/bruto parcial puede venir con dígitos
+      //    corruptos del OCR. El ÚNICO valor verificado (por el cuadre) es el neto
+      //    tipeado: iva y bruto se derivan de él con el 19% legal y se DESCARTA
+      //    cualquier resto parcial del OCR. La tarjeta muestra exactamente esto.
+      // 3. Neto leído por OCR: se respeta el triple neto/iva/bruto tal como vino
+      //    (igual que siempre) — NO derivamos IVA acá: una factura exenta bien
+      //    leída trae iva=0 legítimo y pisarlo con 19% sería inventar plata.
+      //    Única reparación: bruto ausente (=0) se escribe como neto+iva, no 0.
+      let costos;
+      if (!conFactura) {
+        costos = { costo_neto: sumaLineas, iva: 0, costo_bruto: sumaLineas };
+      } else if (netoManual) {
+        const ivaDerivado = Math.round(netoCab * 0.19);
+        costos = { costo_neto: netoCab, iva: ivaDerivado, costo_bruto: netoCab + ivaDerivado };
+      } else {
+        const ivaLeido = Number(iva) || 0;
+        const brutoFinal = Number(costoBruto) > 0 ? Number(costoBruto) : netoCab + ivaLeido;
+        costos = { costo_neto: netoCab, iva: ivaLeido, costo_bruto: brutoFinal };
+      }
       const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos);
       setWmsResult(result);
       setWmsStatus("sent");
@@ -1058,7 +1100,7 @@ function App() {
       setWmsError(err.message);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual]);
 
   // ---- Último costo conocido por SKU (de la última recepción) ----
   // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
@@ -1458,6 +1500,7 @@ function App() {
     
     setExtractedProducts(products);
     setFolioFactura("RAPIDO");
+    setNetoManual(false); // flujo sin factura: no aplica pedir el neto de cabecera
     
     const pages = await generateLabelsPDF(products, "RAPIDO");
     const filtered = pages.filter(p => 
@@ -1532,6 +1575,7 @@ function App() {
     
     setExtractedProducts(valid);
     setFolioFactura("LISTA");
+    setNetoManual(false); // flujo sin factura: no aplica pedir el neto de cabecera
     
     let pages = await generateLabelsPDF(valid, "LISTA");
     if (!showCatSeparators) pages = pages.filter(p => p.type !== "separator-category");
@@ -2065,40 +2109,85 @@ function App() {
               </div>
             )}
 
-            {/* Cuadre líneas vs neto cabecera — atrapa errores de OCR como Folio 532563 */}
+            {/* Cuadre líneas vs neto cabecera — atrapa errores de OCR como Folio 532563.
+                Si el OCR no leyó el total (netoManual), la tarjeta NO se esconde: pide el
+                neto a mano. Esconderla era el bug: sin neto no hay cuadre, y una factura
+                con la parte de abajo cortada (totales + últimos productos) entraba callada
+                como recepción manual — 22 casos entre feb y jul 2026, ej. folio 535410. */}
             {(() => {
               const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
               const netoCab = Number(costoNeto) || 0;
-              // El cuadre solo aplica cuando hay factura (neto de cabecera contra qué comparar).
               // Sin factura (recepción manual RAPIDO/LISTA) no hay nada que cuadrar: el total
               // se muestra en el bloque de envío al WMS. No mostramos esta tarjeta.
-              // <=0 (no solo ===0) para reflejar exactamente el gate del botón (netoCab>0).
-              if (netoCab <= 0) return null;
+              if (netoCab <= 0 && !netoManual) return null;
+              const sinNeto = netoManual && netoCab <= 0;
               const diff = sumaLineas - netoCab;
               const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
-              const hasIssue = Math.abs(diff) > 100;
-              const hasMinor = Math.abs(diff) > 0 && Math.abs(diff) <= 100;
-              const bg = hasIssue ? "rgba(239,68,68,0.1)" : hasMinor ? "rgba(245,158,11,0.1)" : "rgba(34,197,94,0.1)";
-              const bd = hasIssue ? "rgba(239,68,68,0.4)" : hasMinor ? "rgba(245,158,11,0.4)" : "rgba(34,197,94,0.3)";
-              const fg = hasIssue ? "#EF4444" : hasMinor ? "#F59E0B" : "#22C55E";
+              const hasIssue = !sinNeto && Math.abs(diff) > 100;
+              const hasMinor = !sinNeto && Math.abs(diff) > 0 && Math.abs(diff) <= 100;
+              const bg = sinNeto ? "rgba(245,158,11,0.1)" : hasIssue ? "rgba(239,68,68,0.1)" : hasMinor ? "rgba(245,158,11,0.1)" : "rgba(34,197,94,0.1)";
+              const bd = sinNeto ? "rgba(245,158,11,0.5)" : hasIssue ? "rgba(239,68,68,0.4)" : hasMinor ? "rgba(245,158,11,0.4)" : "rgba(34,197,94,0.3)";
+              const fg = sinNeto ? "#F59E0B" : hasIssue ? "#EF4444" : hasMinor ? "#F59E0B" : "#22C55E";
+              // El input vive mientras netoManual esté activo (aunque ya se haya tipeado
+              // algo): si desapareciera al primer dígito, el operador no podría terminar
+              // de escribir. El cuadre de abajo se actualiza en vivo con cada tecla.
+              // MISMA fórmula que usa sendToWMS en modo netoManual: iva y bruto se
+              // derivan SIEMPRE del neto tipeado (19% legal) y se descarta cualquier
+              // resto parcial del OCR — un total leído a medias puede traer dígitos
+              // corruptos. La tarjeta nunca muestra un número distinto del que se
+              // registra.
+              const ivaCalc = Math.round(netoCab * 0.19);
               return (
                 <div style={{padding: "10px 14px", background: bg, border: `1px solid ${bd}`, borderRadius: 8, marginBottom: 12}}>
-                  <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4}}>
-                    <span style={{fontWeight: 700, color: fg, fontSize: 13}}>
-                      {hasIssue ? "⚠️ Costos no cuadran" : hasMinor ? "⚠ Redondeo menor" : "✓ Costos cuadran"}
-                    </span>
-                    <span style={{fontWeight: 700, color: fg, fontFamily: "'Courier New', monospace", fontSize: 13}}>
-                      {diff >= 0 ? "+" : ""}{fmt(diff)}
-                    </span>
-                  </div>
-                  <div style={{display: "flex", justifyContent: "space-between", fontSize: 11, color: "#888", fontFamily: "'Courier New', monospace"}}>
-                    <span>Suma líneas: {fmt(sumaLineas)}</span>
-                    <span>Neto cabecera: {fmt(netoCab)}</span>
-                  </div>
-                  {hasIssue && (
-                    <div style={{marginTop: 6, fontSize: 11, color: "#EF4444"}}>
-                      Editá el costo unitario de las líneas hasta que cuadre con la cabecera. Envío al WMS bloqueado.
+                  {netoManual && (
+                    <div style={{marginBottom: netoCab > 0 ? 10 : 0}}>
+                      <div style={{fontWeight: 700, color: "#F59E0B", fontSize: 13}}>⚠️ No se leyó el total de la factura</div>
+                      <div style={{fontSize: 11, color: "#F59E0B", margin: "4px 0 8px", lineHeight: 1.5}}>
+                        Posible foto cortada abajo: ahí están los totales <strong>y los últimos productos</strong>.
+                        Revisá que estén TODOS los productos en la lista (o sacá la foto de nuevo, completa),
+                        y escribí el NETO impreso en la factura:
+                      </div>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="Neto de la factura (sin IVA), ej: 5695000"
+                        value={costoNeto || ""}
+                        onChange={(e) => setCostoNeto(Number((e.target.value || "").replace(/[^\d]/g, "")) || 0)}
+                        style={{width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(245,158,11,0.6)", background: "#1a1a1f", color: "#fff", fontSize: 14, fontFamily: "'Courier New', monospace", boxSizing: "border-box"}}
+                      />
+                      {netoCab > 0 && (
+                        <div style={{marginTop: 6, fontSize: 11, color: "#888"}}>
+                          Se registrará: IVA 19% {fmt(ivaCalc)} · Total {fmt(netoCab + ivaCalc)} (calculados desde el neto escrito)
+                        </div>
+                      )}
                     </div>
+                  )}
+                  {sinNeto ? (
+                    <div style={{marginTop: 8, fontSize: 11, color: "#F59E0B", fontWeight: 600}}>
+                      Envío al WMS bloqueado hasta escribir el neto. Las etiquetas se pueden imprimir igual.
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4}}>
+                        <span style={{fontWeight: 700, color: fg, fontSize: 13}}>
+                          {hasIssue ? "⚠️ Costos no cuadran" : hasMinor ? "⚠ Redondeo menor" : "✓ Costos cuadran"}
+                        </span>
+                        <span style={{fontWeight: 700, color: fg, fontFamily: "'Courier New', monospace", fontSize: 13}}>
+                          {diff >= 0 ? "+" : ""}{fmt(diff)}
+                        </span>
+                      </div>
+                      <div style={{display: "flex", justifyContent: "space-between", fontSize: 11, color: "#888", fontFamily: "'Courier New', monospace"}}>
+                        <span>Suma líneas: {fmt(sumaLineas)}</span>
+                        <span>{netoManual ? "Neto escrito a mano" : "Neto cabecera"}: {fmt(netoCab)}</span>
+                      </div>
+                      {hasIssue && (
+                        <div style={{marginTop: 6, fontSize: 11, color: "#EF4444"}}>
+                          {netoManual
+                            ? "Las líneas no cuadran con el neto que escribiste: probablemente FALTAN PRODUCTOS (foto cortada). Sacá la foto de nuevo incluyendo toda la factura, o agregá las líneas que faltan. Envío al WMS bloqueado."
+                            : "Editá el costo unitario de las líneas hasta que cuadre con la cabecera. Envío al WMS bloqueado."}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               );
@@ -2302,7 +2391,11 @@ function App() {
                   const netoCab = Number(costoNeto) || 0;
                   const sinCostos = sumaLineas <= 0;
                   const desfase = netoCab > 0 && Math.abs(sumaLineas - netoCab) > 100;
-                  const blocked = sinCostos || desfase;
+                  // Misma regla que el guard de sendToWMS: con factura, el neto es
+                  // obligatorio (es lo único que detecta productos faltantes).
+                  const esFlujoManual = folioFactura === "RAPIDO" || folioFactura === "LISTA";
+                  const netoFaltante = !!invoiceImage && !esFlujoManual && netoCab <= 0;
+                  const blocked = sinCostos || desfase || netoFaltante;
                   const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
                   return (
                     <>
@@ -2315,7 +2408,7 @@ function App() {
                         disabled={blocked}
                         style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: blocked ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: blocked ? "#666" : "#fff", fontSize: 14, fontWeight: 700, border: blocked ? "1px solid #333" : "none", cursor: blocked ? "not-allowed" : "pointer", opacity: blocked ? 0.7 : 1}}
                       >
-                        {sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
+                        {netoFaltante ? "🚫 Escribí el neto de la factura (tarjeta amarilla de arriba)" : sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
                       </button>
                     </>
                   );
@@ -2387,13 +2480,17 @@ function App() {
                 ) : (() => {
                   const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
                   const sinCostos = sumaLineas <= 0;
-                  const dis = wmsStatus === "sending" || sinCostos;
+                  // Misma regla que en el paso Editar: con factura, sin neto no se envía.
+                  const netoCab = Number(costoNeto) || 0;
+                  const esFlujoManual = folioFactura === "RAPIDO" || folioFactura === "LISTA";
+                  const netoFaltante = !!invoiceImage && !esFlujoManual && netoCab <= 0;
+                  const dis = wmsStatus === "sending" || sinCostos || netoFaltante;
                   return (
                   <button
                     onClick={sendToWMS} disabled={dis}
                     style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: dis ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: dis ? "#666" : "#fff", fontSize: 13, fontWeight: 700, border: dis ? "1px solid #333" : "none", cursor: dis ? "not-allowed" : "pointer"}}
                   >
-                    {wmsStatus === "sending" ? "⏳ Enviando..." : sinCostos ? "🚫 Sin costos — andá a \"Editar\" para cargarlos" : "📦 Enviar recepción al WMS"}
+                    {wmsStatus === "sending" ? "⏳ Enviando..." : netoFaltante ? "🚫 Falta el neto de la factura — volvé a \"Editar\"" : sinCostos ? "🚫 Sin costos — andá a \"Editar\" para cargarlos" : "📦 Enviar recepción al WMS"}
                   </button>
                   );
                 })()}
@@ -2433,6 +2530,7 @@ function App() {
                 setProveedorFactura("");
                 setWmsStatus(""); setWmsError("");
                 setCostoNeto(0); setIva(0); setCostoBruto(0);
+                setNetoManual(false);
                 setQuickItems([]);
                 setQuickSearch("");
                 setPasteText("");
