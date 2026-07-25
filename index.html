@@ -181,9 +181,36 @@ async function inferirProveedorPorSkus(skus) {
   }
 }
 
-async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos, rut) {
+// Wrapper de RPC con feature-detection. Regla 3 del ecosistema: nunca tragar el
+// error. Devuelve { data, error, ausente }: `ausente` = la función no existe en la
+// base (RPC no desplegada aún) → el panel de vínculo se degrada y desaparece sin
+// romper el envío. Cualquier otro error se reporta como aviso discreto.
+async function rpcOC(sb, fn, params) {
+  try {
+    const { data, error } = await sb.rpc(fn, params);
+    if (error) {
+      const msg = (error.message || "") + " " + (error.details || "") + " " + (error.hint || "");
+      const ausente = error.code === "PGRST202" ||
+        /could not find the function|does not exist|no existe la función|undefined function/i.test(msg);
+      console.warn("[rpcOC] " + fn + " error:", error.code, error.message);
+      return { data: null, error, ausente };
+    }
+    return { data, error: null, ausente: false };
+  } catch (e) {
+    console.warn("[rpcOC] " + fn + " throw:", e?.message || e);
+    return { data: null, error: e, ausente: false };
+  }
+}
+
+async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos, rut, ocLink) {
   const sb = getWMSClient();
   if (!sb) throw new Error("WMS no configurado");
+  // ocLink: decisión ya tomada en el panel de vínculo de la pantalla de revisión.
+  // Acá NO se decide nada — solo se escribe lo que el panel resolvió. Todas las
+  // columnas existen y son nullable, así que el caso "sin vínculo" (objeto vacío)
+  // deja todo en null y el comportamiento es idéntico al histórico.
+  const oc = ocLink || {};
+  const nz = (v) => { const s = (v == null ? "" : String(v)).trim(); return s.length ? s : null; };
 
   // 1. Upload image to Supabase Storage
   let imagenUrl = "";
@@ -232,9 +259,43 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     costo_bruto: costos?.costo_bruto || 0,
     notas: "",
     created_by: "App Etiquetas",
+    // Vínculo con OC + referencias crudas. Van SIEMPRE (null si no aplica).
+    orden_compra_id: nz(oc.orden_compra_id),
+    oc_conflicto: nz(oc.oc_conflicto),
+    sin_oc_motivo: nz(oc.sin_oc_motivo),
+    ref_oc_ocr: nz(oc.ref_oc_ocr),
+    ref_ovt: nz(oc.ref_ovt),
+    ref_fvta: nz(oc.ref_fvta),
   }).select("id").single();
 
-  if (recErr) throw new Error("Error creando recepción: " + recErr.message);
+  if (recErr) {
+    // Doble carga de la MISMA factura: ref_fvta tiene UNIQUE parcial → 23505
+    // (unique_violation). Se bloquea SOLO este caso, con un mensaje que dice
+    // cuándo se cargó antes. Cualquier otro error se propaga tal cual.
+    const dupFvta = recErr.code === "23505" &&
+      (/fvta/i.test(String(recErr.message || "") + String(recErr.details || "")) || nz(oc.ref_fvta));
+    if (dupFvta && nz(oc.ref_fvta)) {
+      let detalle = "";
+      try {
+        const { data: prev } = await sb.from("recepciones")
+          .select("folio, created_at")
+          .eq("ref_fvta", nz(oc.ref_fvta))
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        if (prev) {
+          const f = prev.created_at
+            ? new Date(prev.created_at).toLocaleDateString("es-CL", { day: "2-digit", month: "2-digit", year: "numeric" })
+            : "fecha desconocida";
+          detalle = ` Ya se cargó el ${f}` + (prev.folio ? ` (folio ${prev.folio})` : "") + ".";
+        }
+      } catch (_) { /* best-effort: si el lookup falla, igual avisamos del duplicado */ }
+      const e = new Error(`Esta factura (FVTA_${nz(oc.ref_fvta)}) ya fue cargada antes; no se registra de nuevo.${detalle} Si es un error, avisá con el folio.`);
+      e.esDupFvta = true;
+      throw e;
+    }
+    throw new Error("Error creando recepción: " + recErr.message);
+  }
   const recId = rec.id;
 
   // 3. Create líneas
@@ -529,6 +590,22 @@ function App() {
   // 535410). Con esta marca la tarjeta de cuadre pide el neto A MANO y el envio
   // al WMS queda bloqueado hasta que el operador lo escriba.
   const [netoManual, setNetoManual] = useState(false);
+  // ---- Vínculo con Orden de Compra (OC) ----
+  // Datos crudos leídos por OCR (Task 1 de api/process.js). Van SIEMPRE al INSERT
+  // como auditoría, se vincule o no una OC. ref_fvta además tiene UNIQUE parcial:
+  // doble carga de la misma factura revienta con 23505 (se maneja abajo).
+  const [refOcOcr, setRefOcOcr] = useState("");   // referencia_oc del recuadro DOCUMENTO(S) DE REFERENCIA
+  const [refOvt, setRefOvt] = useState("");       // OVT del header O.Compra
+  const [refFvta, setRefFvta] = useState("");     // FVTA del header O.Compra
+  // Estado del panel de vínculo (se recalcula al entrar a "review").
+  // ocStatus: "idle" | "loading" | "ready" | "na" (RPC no disponible / falló → degradar sin bloquear)
+  const [ocStatus, setOcStatus] = useState("idle");
+  const [ocProveedorId, setOcProveedorId] = useState(null);
+  const [ocCandidatas, setOcCandidatas] = useState([]);   // buscar_oc_candidatas → hasta 5
+  const [ocValidResult, setOcValidResult] = useState(null); // validar_referencia_oc → 1 fila (o null)
+  const [ocSeleccion, setOcSeleccion] = useState(null);   // {orden_compra_id, numero, estado, cobertura, source}
+  const [sinOcMotivo, setSinOcMotivo] = useState("");     // muestra | regalo_proveedor | compra_directa | sin_referencia_documental
+  const [ocNota, setOcNota] = useState("");               // aviso discreto si una RPC falla (Regla 3: no tragar el error)
   const [lastCosts, setLastCosts] = useState({}); // sku(upper) -> {costo, fecha} última recepción
   const [dictionary, setDictionary] = useState([]);
   const [hasDictionary, setHasDictionary] = useState(false);
@@ -934,6 +1011,15 @@ function App() {
       // Se pide a mano en la tarjeta de cuadre; el envio queda bloqueado hasta ahi.
       setNetoManual(!(Number(parsed.costo_neto) > 0));
       setWmsStatus(""); setWmsError("");
+      // Referencias de OC leídas por OCR (Task 1). Retrocompatibles: si el modelo
+      // no las trae (facturas viejas / no-Idetex) quedan "" y el flujo sigue igual.
+      setRefOcOcr((parsed.referencia_oc || "").toString().trim());
+      setRefOvt((parsed.ovt || "").toString().trim());
+      setRefFvta((parsed.fvta || "").toString().trim());
+      // Reset del panel de vínculo: cada factura arranca sin decisión (el efecto
+      // de "review" lo recalcula). Evita arrastrar la OC de la factura anterior.
+      setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
+      setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
       // Cross-reference with dictionary - exact + OCR fuzzy match (I↔1, O↔0, etc.)
@@ -1093,14 +1179,28 @@ function App() {
         const brutoFinal = Number(costoBruto) > 0 ? Number(costoBruto) : netoCab + ivaLeido;
         costos = { costo_neto: netoCab, iva: ivaLeido, costo_bruto: brutoFinal };
       }
-      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos);
+      // Decisión de vínculo tomada en el panel → objeto que el INSERT escribe tal cual.
+      // Prioridad: OC seleccionada > motivo sin-OC > conflicto determinista sin resolver > cola.
+      const conflictoPend = !ocSeleccion && !sinOcMotivo &&
+        ocValidResult && ocValidResult.resultado && ocValidResult.resultado !== "ok";
+      const ocLink = {
+        ref_oc_ocr: refOcOcr || null,
+        ref_ovt: refOvt || null,
+        ref_fvta: refFvta || null,
+        orden_compra_id: (ocSeleccion && ocSeleccion.orden_compra_id) || null,
+        sin_oc_motivo: (!ocSeleccion && sinOcMotivo) ? sinOcMotivo : null,
+        oc_conflicto: conflictoPend
+          ? ((refOcOcr ? "OC-" + refOcOcr + " · " : "") + ocValidResult.resultado)
+          : null,
+      };
+      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos, null, ocLink);
       setWmsResult(result);
       setWmsStatus("sent");
     } catch (err) {
       setWmsError(err.message);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult]);
 
   // ---- Último costo conocido por SKU (de la última recepción) ----
   // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
@@ -1135,6 +1235,94 @@ function App() {
       fetchLastCosts(skuSig.split(",").filter(Boolean));
     }
   }, [step, skuSig, fetchLastCosts]);
+
+  // ---- Vínculo con Orden de Compra ----
+  // Resuelve proveedor y corre el/los RPC de vínculo. Es best-effort: si algo
+  // falla, degrada a manual/sin-OC y NUNCA bloquea el envío físico.
+  const cargarVinculoOC = useCallback(async () => {
+    const sb = getWMSClient();
+    if (!sb) { setOcStatus("na"); return; }
+    setOcStatus("loading"); setOcNota("");
+    // Cada carga arranca limpia (también al "recalcular" a mano). Las refs crudas
+    // (ref_oc_ocr/ovt/fvta) NO se tocan acá: son datos de OCR, no decisión.
+    setOcSeleccion(null); setSinOcMotivo(""); setOcValidResult(null); setOcCandidatas([]);
+
+    // Líneas parseadas → skus/cantidades paralelas (mismo filtro que el INSERT de líneas).
+    const lineas = (extractedProducts || []).filter(p => (p.sku || "").trim() && Number(p.cantidad) > 0);
+    const skus = lineas.map(p => (p.sku || "").toUpperCase().trim());
+    const cantidades = lineas.map(p => Number(p.cantidad) || 0);
+
+    // 1. Resolver proveedor (defensivo). Sin proveedor_id no hay contra qué validar/buscar.
+    let proveedor_id = null;
+    try {
+      const r = await resolveProveedor(proveedorFactura, null);
+      proveedor_id = r?.proveedor_id || null;
+    } catch (_) { proveedor_id = null; }
+    setOcProveedorId(proveedor_id);
+
+    if (!proveedor_id || skus.length === 0) {
+      // RAPIDO sin proveedor, o factura sin líneas válidas: solo manual / sin-OC.
+      if (!proveedor_id) setOcNota("No se pudo resolver el proveedor: elegí la OC a mano o marcá 'sin OC'.");
+      setOcStatus("ready");
+      return;
+    }
+
+    let rpcCaida = false;
+    let candidatas = [];
+
+    // 2. Candidatas SIEMPRE (habilitan selector manual y camino probabilístico).
+    const cand = await rpcOC(sb, "buscar_oc_candidatas", {
+      p_proveedor_id: proveedor_id, p_skus: skus, p_cantidades: cantidades,
+    });
+    if (cand.ausente) { setOcStatus("na"); return; } // feature no desplegada → panel oculto
+    if (cand.error) { rpcCaida = true; }
+    else { candidatas = Array.isArray(cand.data) ? cand.data : []; setOcCandidatas(candidatas); }
+
+    if (refOcOcr) {
+      // 3a. DETERMINISTA: validar la referencia leída en el papel.
+      const val = await rpcOC(sb, "validar_referencia_oc", {
+        p_proveedor_id: proveedor_id, p_numero_ref: refOcOcr, p_skus: skus, p_cantidades: cantidades,
+      });
+      if (val.ausente) { setOcStatus("na"); return; }
+      if (val.error) { rpcCaida = true; }
+      else {
+        const row = Array.isArray(val.data) ? val.data[0] : val.data;
+        if (row) {
+          setOcValidResult(row);
+          if (row.resultado === "ok" && row.orden_id) {
+            setOcSeleccion({ orden_compra_id: row.orden_id, numero: row.numero, estado: row.estado, cobertura: row.cobertura, source: "determinista" });
+          }
+          // resultado != ok → sin auto-vínculo; el panel muestra aviso ámbar y el
+          // operario puede vincular a mano desde las candidatas si quiere.
+        }
+      }
+    } else if (candidatas.length > 0) {
+      // 3b. PROBABILÍSTICO: proponer top1 solo si es claramente la mejor.
+      const t1 = candidatas[0], t2 = candidatas[1] || null;
+      const clara = Number(t1.cobertura) >= 0.6 && Number(t1.qty_ratio) >= 0.5 &&
+        (!t2 || Number(t1.score) >= 1.4 * Number(t2.score));
+      if (clara) {
+        setOcSeleccion({ orden_compra_id: t1.orden_id, numero: t1.numero, estado: t1.estado, cobertura: t1.cobertura, source: "sugerida" });
+      }
+      // varias sin ganador claro → sin preselección; el panel muestra el selector.
+    }
+
+    if (rpcCaida) setOcNota("El matcher de OC falló; podés vincular a mano o enviar sin OC.");
+    setOcStatus("ready");
+  }, [extractedProducts, proveedorFactura, refOcOcr]);
+
+  // Corre el vínculo UNA vez por factura al entrar a "review". La firma es
+  // folio+fvta+proveedor: NO cambia al editar SKUs/cantidades, así una edición no
+  // pisa la decisión que el operario ya tomó. "Recalcular" (botón del panel) llama
+  // cargarVinculoOC directo cuando sí quiere re-evaluar.
+  const ocLoadSigRef = useRef(null);
+  useEffect(() => {
+    if (step !== "review" || !isWMSConfigured()) return;
+    const sig = (folioFactura || "") + "|" + (refFvta || "") + "|" + (proveedorFactura || "");
+    if (ocLoadSigRef.current === sig && ocStatus !== "idle") return;
+    ocLoadSigRef.current = sig;
+    cargarVinculoOC();
+  }, [step, folioFactura, refFvta, proveedorFactura, ocStatus, cargarVinculoOC]);
 
   // ---- Download Labels PDF ----
   const downloadLabelsPDF = useCallback(async () => {
@@ -1501,6 +1689,11 @@ function App() {
     setExtractedProducts(products);
     setFolioFactura("RAPIDO");
     setNetoManual(false); // flujo sin factura: no aplica pedir el neto de cabecera
+    // Sin factura: no hay referencias de OCR. Limpiamos por si venían de una factura
+    // previa de la misma sesión (evita escribir un ref_fvta ajeno en el INSERT).
+    setRefOcOcr(""); setRefOvt(""); setRefFvta("");
+    setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
+    setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
     
     const pages = await generateLabelsPDF(products, "RAPIDO");
     const filtered = pages.filter(p => 
@@ -1576,6 +1769,10 @@ function App() {
     setExtractedProducts(valid);
     setFolioFactura("LISTA");
     setNetoManual(false); // flujo sin factura: no aplica pedir el neto de cabecera
+    // Sin factura: limpiamos referencias/vínculo por si venían de una factura previa.
+    setRefOcOcr(""); setRefOvt(""); setRefFvta("");
+    setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
+    setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
     
     let pages = await generateLabelsPDF(valid, "LISTA");
     if (!showCatSeparators) pages = pages.filter(p => p.type !== "separator-category");
@@ -2193,6 +2390,110 @@ function App() {
               );
             })()}
 
+            {/* Panel de vínculo con Orden de Compra. Se oculta si las RPC no están
+                desplegadas (ocStatus "na") → degradación elegante. NUNCA bloquea el
+                envío: es una decisión opcional que viaja al INSERT. */}
+            {isWMSConfigured() && ocStatus !== "na" && (() => {
+              const sel = ocSeleccion;
+              const MOT_CONFLICTO = {
+                conflicto_skus: "los SKU no coinciden con esa OC",
+                oc_no_existe: "esa OC no existe",
+                oc_cerrada: "esa OC ya está cerrada",
+                oc_otro_proveedor: "esa OC es de otro proveedor",
+              };
+              const conflicto = !sel && ocValidResult && ocValidResult.resultado && ocValidResult.resultado !== "ok"
+                ? ocValidResult.resultado : null;
+              const pct = (x) => Math.round((Number(x) || 0) * 100) + "%";
+              const cargando = ocStatus === "loading" || ocStatus === "idle";
+              const chipColor = sel ? (sel.source === "determinista" ? "#22C55E" : sel.source === "sugerida" ? "#F59E0B" : "#3B82F6") : "#888";
+              const seleccionar = (c) => { setOcSeleccion({ orden_compra_id: c.orden_id, numero: c.numero, estado: c.estado, cobertura: c.cobertura, source: "manual" }); setSinOcMotivo(""); };
+              return (
+                <div style={{padding: "10px 14px", background: "rgba(139,92,246,0.06)", border: "1px solid rgba(139,92,246,0.25)", borderRadius: 8, marginBottom: 12}}>
+                  <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
+                    <span style={{fontWeight: 700, color: "#A78BFA", fontSize: 13}}>🔗 Orden de compra</span>
+                    {!cargando && (
+                      <span onClick={cargarVinculoOC} style={{fontSize: 11, color: "#888", cursor: "pointer"}} title="Volver a buscar OC">↻ recalcular</span>
+                    )}
+                  </div>
+
+                  {cargando ? (
+                    <div style={{fontSize: 12, color: "#888", marginTop: 8}}>Buscando orden de compra…</div>
+                  ) : (
+                    <div style={{marginTop: 8}}>
+                      {sel ? (
+                        <div style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "8px 10px", background: "#141416", border: `1px solid ${chipColor}55`, borderRadius: 8}}>
+                          <span style={{fontWeight: 700, color: chipColor, fontSize: 13}}>
+                            OC-{sel.numero} {sel.source === "determinista" ? "✓" : sel.source === "sugerida" ? "· sugerida" : "· manual"}
+                            {sel.cobertura != null && <span style={{color: "#888", fontWeight: 500, marginLeft: 6}}>cobertura {pct(sel.cobertura)}</span>}
+                          </span>
+                          <span onClick={() => setOcSeleccion(null)} style={{fontSize: 11, color: "#EF4444", cursor: "pointer"}}>quitar</span>
+                        </div>
+                      ) : sinOcMotivo ? (
+                        <div style={{padding: "8px 10px", background: "#141416", border: "1px solid #2A2A30", borderRadius: 8, fontSize: 12, color: "#ccc"}}>
+                          Se registrará <strong>sin OC</strong> ({sinOcMotivo.replace(/_/g, " ")}).
+                        </div>
+                      ) : (
+                        <div style={{fontSize: 12, color: "#888"}}>Sin vínculo: quedará en la cola para asignar OC después.</div>
+                      )}
+
+                      {sel && sel.source === "sugerida" && (
+                        <div style={{marginTop: 6, fontSize: 11, color: "#F59E0B"}}>Sugerida por el matcher — tocá otra candidata para cambiar, o confirmá enviando.</div>
+                      )}
+
+                      {conflicto && (
+                        <div style={{marginTop: 8, padding: "8px 10px", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.4)", borderRadius: 8, fontSize: 12, color: "#F59E0B"}}>
+                          ⚠️ El papel dice <strong>OC-{refOcOcr}</strong> pero {MOT_CONFLICTO[conflicto] || conflicto}. Se registra sin vínculo (queda anotado); podés vincular a mano abajo si corresponde.
+                        </div>
+                      )}
+
+                      {ocNota && (
+                        <div style={{marginTop: 8, fontSize: 11, color: "#F59E0B"}}>{ocNota}</div>
+                      )}
+
+                      {ocCandidatas.length > 0 && (
+                        <div style={{marginTop: 8}}>
+                          <div style={{fontSize: 11, color: "#666", marginBottom: 4}}>{sel ? "Cambiar a otra OC:" : "Órdenes candidatas:"}</div>
+                          {ocCandidatas.map((c, i) => {
+                            const activa = sel && sel.orden_compra_id === c.orden_id;
+                            return (
+                              <div key={c.orden_id || i} onClick={() => seleccionar(c)}
+                                style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 10px", marginBottom: 4, borderRadius: 8, cursor: "pointer",
+                                  background: activa ? "rgba(59,130,246,0.12)" : "#141416", border: `1px solid ${activa ? "#3B82F6" : "#2A2A30"}`}}>
+                                <span style={{fontFamily: "'Courier New', monospace", fontWeight: 700, fontSize: 12, color: "#E8E8EC"}}>
+                                  OC-{c.numero} <span style={{color: "#888", fontWeight: 500}}>· {c.estado}</span>
+                                </span>
+                                <span style={{fontSize: 11, color: "#888"}}>cob. {pct(c.cobertura)}{c.qty_ratio != null ? " · cant. " + pct(c.qty_ratio) : ""}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      <div style={{marginTop: 8, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap"}}>
+                        <span style={{fontSize: 11, color: "#666"}}>o marcar sin OC:</span>
+                        <select value={sinOcMotivo} onChange={(e) => { const v = e.target.value; setSinOcMotivo(v); if (v) setOcSeleccion(null); }}
+                          style={{flex: 1, minWidth: 160, padding: "7px 10px", borderRadius: 8, background: "#0A0A0B", color: "#E8E8EC", border: "1px solid #2A2A30", fontSize: 12}}>
+                          <option value="">— dejar en cola —</option>
+                          <option value="muestra">muestra</option>
+                          <option value="regalo_proveedor">regalo del proveedor</option>
+                          <option value="compra_directa">compra directa</option>
+                          <option value="sin_referencia_documental">sin referencia documental</option>
+                        </select>
+                      </div>
+
+                      {(refOvt || refFvta || refOcOcr) && (
+                        <div style={{marginTop: 8, fontSize: 10, color: "#555", fontFamily: "'Courier New', monospace"}}>
+                          {refOvt && <span>OVT_{refOvt} </span>}
+                          {refFvta && <span>FVTA_{refFvta} </span>}
+                          {refOcOcr && <span>· ref OC leída: {refOcOcr}</span>}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             {unmatchedProducts.length > 0 && (
               <div style={styles.warningCard}>
                 <div style={{fontSize: 24}}>⚠️</div>
@@ -2531,6 +2832,9 @@ function App() {
                 setWmsStatus(""); setWmsError("");
                 setCostoNeto(0); setIva(0); setCostoBruto(0);
                 setNetoManual(false);
+                setRefOcOcr(""); setRefOvt(""); setRefFvta("");
+                setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
+                setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
                 setQuickItems([]);
                 setQuickSearch("");
                 setPasteText("");

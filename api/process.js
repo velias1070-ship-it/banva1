@@ -172,9 +172,14 @@ REGLAS:
 - NO inventes productos ni SKUs. Si algo es ilegible, omítelo
 - Cada fila de la tabla es un producto SEPARADO
 
+REFERENCIAS DE ORDEN DE COMPRA (opcionales, NO afectan la lista de productos):
+- referencia_oc: en el recuadro "DOCUMENTO(S) DE REFERENCIA" (normalmente al pie de la factura), el número que sigue a "Orden de Compra N°". Devuelve SOLO los dígitos, conservando ceros a la izquierda (ej: "Orden de Compra N° 036 / 12-ago-2026" → "036"). Si ese recuadro NO aparece, usa null.
+- ovt y fvta: en el header, el campo "O.Compra" con formato OVT_########/FVTA_######## (ej: "O.Compra: OVT_00123456/FVTA_00987654"). Devuelve ovt con SOLO los dígitos que siguen a "OVT_" ("00123456") y fvta con SOLO los dígitos que siguen a "FVTA_" ("00987654"). Si el campo no está o falta una parte, usa null en la parte faltante.
+- Estos tres campos son datos crudos de referencia: NUNCA los inventes ni los deduzcas de los productos. Si no los ves textualmente en el OCR, van null.
+
 Responde SOLO JSON válido, COMPACTO: todo en una sola línea, sin saltos de línea,
 sin indentación y sin espacios entre campos. Nada de texto antes ni después del JSON.
-{"folio":"","proveedor":"","costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta"}]}`;
+{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta"}]}`;
 
   // Modelos en orden de preferencia. Si Anthropic retira el primero
   // (404 not_found_error), cae automaticamente al siguiente y la app NO se cae.
