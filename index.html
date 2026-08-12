@@ -310,6 +310,10 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
         const { data: prev } = await sb.from("recepciones")
           .select("folio, created_at")
           .eq("ref_fvta", nz(oc.ref_fvta))
+          // Las ANULADAS ya no ocupan el cupo FVTA (banvabodega 0105): si el
+          // INSERT choca con 23505 es contra una recepcion VIVA — el mensaje
+          // debe nombrar a esa, no a una anulada que justamente libero el cupo.
+          .neq("estado", "ANULADA")
           .order("created_at", { ascending: true })
           .limit(1)
           .maybeSingle();
