@@ -235,15 +235,27 @@
   function checkCodigosFactura(ocrText, productos, skusCatalogo) {
     if (!ocrText) return [];
     const skusLinea = [];
+    // Base del descarte de fragmentos: SOLO sku y skuVenta reales. skuOriginal
+    // (texto crudo del OCR) sigue contando para la cobertura por distancia,
+    // pero un token pegoteado ahi no debe tapar candidatos como "fragmento".
+    const skusPresentes = [];
     (productos || []).forEach(function (p) {
       if (!p) return;
-      const s = normSku(p.sku); if (s) skusLinea.push(s);
-      const sv = normSku(p.skuVenta); if (sv) skusLinea.push(sv);
+      const s = normSku(p.sku); if (s) { skusLinea.push(s); skusPresentes.push(s); }
+      const sv = normSku(p.skuVenta); if (sv) { skusLinea.push(sv); skusPresentes.push(sv); }
       const so = normSku(p.skuOriginal); if (so) skusLinea.push(so);
     });
     const catalogo = (skusCatalogo || []).map(normSku).filter(Boolean);
+    const catalogoSet = new Set(catalogo);
+    // Hash barato del CONTENIDO del catalogo: la decision de descartar un
+    // fragmento depende de la pertenencia exacta (catalogoSet.has), asi que un
+    // catalogo del mismo largo pero distinto contenido no puede reusar cache.
+    let catHash = 0;
+    for (const s of catalogo) {
+      for (let i = 0; i < s.length; i++) catHash = (catHash * 31 + s.charCodeAt(i)) | 0;
+    }
     const cacheKey = String(ocrText).length + "|" + String(ocrText).slice(0, 80) +
-      "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length;
+      "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length + "|" + catHash;
     if (cacheKey === _codCacheKey) return _codCacheVal;
 
     const candidatos = new Set();
@@ -259,6 +271,26 @@
     const enLinea = new Set(skusLinea);
     const out = [];
     candidatos.forEach(function (cod) {
+      // Fragmento cortado por el pliegue: PEDAZO ESTRICTO (s !== cod) de un
+      // SKU presente Y que NO sea un SKU legitimo del catalogo. La segunda
+      // condicion es vital: el catalogo real tiene familias donde un SKU es
+      // prefijo de su variante pack (RAPAC50X70AFA ⊂ ...X2, LICAAFVIS5746 ⊂
+      // ...X1, TXALMILLVIS46 ⊂ ...X2 — con historial real de recepcion): un
+      // producto corto OMITIDO quedaria "cubierto" por el pack presente. El
+      // fragmento real ("XW26PMVC") no existe en el catalogo — se distingue.
+      // Sin catalogo (diccionario caido / no cargado) el descarte NO corre:
+      // fallar CERRADO. Sin la pertenencia exacta no se puede distinguir un
+      // fragmento de pliegue de un SKU corto real, y preferimos el falso
+      // positivo (alarma re-escaneable) a tapar una omision en silencio.
+      const esSkuDeCatalogo = catalogoSet.size === 0 || catalogoSet.has(cod);
+      let esFragmento = false;
+      if (!esSkuDeCatalogo) {
+        for (const s of skusPresentes) {
+          if (s !== cod && s.indexOf(cod) !== -1) { esFragmento = true; break; }
+        }
+      }
+      if (esFragmento) return;
+
       let minLinea = 3;
       for (const s of skusLinea) {
         const d = levenshtein(cod, s, 2);

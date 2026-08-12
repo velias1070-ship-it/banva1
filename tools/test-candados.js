@@ -397,6 +397,81 @@ Solución de Factura Electrónica de: www.acepta.com`;
 }
 
 // ------------------------------------------------------------
+// CASO 12 — Fragmento cortado por el pliegue (caso real 12-ago: "XW26PMVC",
+// prefijo comun de los 4 plumones PRESENTES) no debe alarmar; un producto
+// OMITIDO de verdad (codigo completo sin linea) debe seguir alarmando aunque
+// el fragmento tambien este en el texto.
+// ------------------------------------------------------------
+console.log("CASO 12 — fragmento de pliegue vs producto omitido:");
+{
+  const plumones = [
+    linea("TXW26PMVC15CR", "Plumon VL Corduroy Sherpa 15P Crema", 4, 14000),
+    linea("TXW26PMVC20AZ", "Plumon VL Corduroy Sherpa 20P Azul", 8, 16000),
+    linea("TXW26PMVC25AZ", "Plumon VL Corduroy Sherpa 25P Azul", 8, 18000),
+    linea("TXW26PMVC25TE", "Plumon VL Corduroy Sherpa 25P Terracota", 8, 18000),
+  ];
+  const resFragmento = Locks.evaluarCandados({
+    productos: plumones,
+    ocrText: "XW26PMVC\nTXW26PMVC15CR\nTXW26PMVC20AZ\nTXW26PMVC25AZ\nTXW26PMVC25TE",
+    skusCatalogo: Object.keys(DICT),
+  });
+  check("fragmento XW26PMVC con sus 4 lineas presentes = 0 bloqueos",
+    resFragmento.bloqueos.length === 0, JSON.stringify(resFragmento.bloqueos.map(b => b.mensaje)));
+
+  const resOmitido = Locks.evaluarCandados({
+    productos: plumones,
+    ocrText: "XW26PMVC\nTXW26PMVC15CR\nTXW26QLVD20AZ TXW26QLVD20AZ",
+    skusCatalogo: Object.keys(DICT),
+  });
+  check("producto omitido completo (Dobby) sigue alarmando aunque haya fragmento",
+    resOmitido.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "TXW26QLVD20AZ"));
+}
+
+// ------------------------------------------------------------
+// CASO 13 — REGRESION del descarte de fragmentos (hallazgo auditoria): un SKU
+// corto que es prefijo de su variante pack (RAPAC50X70AFA ⊂ RAPAC50X70AFAX2,
+// par REAL del catalogo con historial) y viene OMITIDO debe seguir alarmando
+// — la regla de fragmentos solo aplica a pedazos que NO son SKUs de catalogo.
+// ------------------------------------------------------------
+console.log("CASO 13 — SKU corto omitido no se tapa con su variante pack:");
+{
+  const catalogoConPacks = Object.keys(DICT).concat(["RAPAC50X70AFA", "RAPAC50X70AFAX2"]);
+  const soloPack = [
+    linea("RAPAC50X70AFAX2", "Pack 2 Almohadas AF 50x70", 10, 6900, { nombreDict: "Pack 2 Almohadas AF 50x70", matched: true }),
+  ];
+  const res = Locks.evaluarCandados({
+    productos: soloPack,
+    ocrText: "RAPAC50X70AFAX2 RAPAC50X70AFAX2\nRAPAC50X70AFA RAPAC50X70AFA",
+    skusCatalogo: catalogoConPacks,
+  });
+  check("RAPAC50X70AFA omitido dispara aunque el pack este presente",
+    res.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "RAPAC50X70AFA"),
+    JSON.stringify(res.bloqueos.map(b => b.mensaje)));
+}
+
+// ------------------------------------------------------------
+// CASO 14 — catalogo VACIO degrada CERRADO (hallazgo auditoria v2): si el
+// diccionario no cargo (red/RLS), el descarte de fragmentos NO corre — sin la
+// pertenencia exacta no se distingue fragmento de SKU corto real, y preferimos
+// la alarma re-escaneable a tapar una omision en silencio. El fragmento del
+// pliegue del 546747 debe volver a alarmar cuando no hay catalogo.
+// ------------------------------------------------------------
+console.log("CASO 14 — sin catalogo, el fragmento NO se descarta (falla cerrado):");
+{
+  const conFragmento = [
+    linea("TXW26PMVC15CR", "Plumon Vicenza 1,5 Pl Crema", 4, 14000, { nombreDict: "Plumon Vicenza 1,5 Pl Crema", matched: true }),
+  ];
+  const res = Locks.evaluarCandados({
+    productos: conFragmento,
+    ocrText: "TXW26PMVC15CR TXW26PMVC15CR\nXW26PMVC25TE XW26PMVC25TE",
+    skusCatalogo: [],
+  });
+  check("fragmento XW26PMVC25TE alarma cuando el catalogo no esta disponible",
+    res.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "XW26PMVC25TE"),
+    JSON.stringify(res.bloqueos.map(b => b.mensaje)));
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");
