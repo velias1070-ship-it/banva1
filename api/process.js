@@ -169,7 +169,7 @@ REGLAS:
 - Costo unitario neto (sin IVA): "P. Unitario", "Precio Unit", "Valor Unit" — número entero sin separador de miles
 - Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos). Devuelve como entero: 3400
 - Montos totales al final: Neto, IVA (19%), Total
-- NO inventes productos ni SKUs. Si algo es ilegible, omítelo
+- NO inventes productos ni SKUs. Si una línea es ilegible o dudosa NO la omitas en silencio: inclúyela con confianza "baja", con lo que hayas podido leer, y cantidad 0 si la cantidad no se lee. El sistema le mostrará esa línea al operador; una línea omitida desaparece sin que nadie lo note
 - Cada fila de la tabla es un producto SEPARADO
 
 REFERENCIAS DE ORDEN DE COMPRA (opcionales, NO afectan la lista de productos):
