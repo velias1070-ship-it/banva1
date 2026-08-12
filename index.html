@@ -25,6 +25,7 @@
 <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="locks.js"></script>
 
 <script type="text/babel">
 const { useState, useRef, useCallback, useEffect } = React;
@@ -202,7 +203,7 @@ async function rpcOC(sb, fn, params) {
   }
 }
 
-async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos, rut, ocLink) {
+async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, costos, rut, ocLink, forense) {
   const sb = getWMSClient();
   if (!sb) throw new Error("WMS no configurado");
   // ocLink: decisión ya tomada en el panel de vínculo de la pantalla de revisión.
@@ -266,6 +267,21 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     ref_oc_ocr: nz(oc.ref_oc_ocr),
     ref_ovt: nz(oc.ref_ovt),
     ref_fvta: nz(oc.ref_fvta),
+    // Forense del escaneo (incidente 546747: sin esto, reconstruir que leyo el
+    // OCR y que respondio el modelo exigio re-correr Vision horas despues).
+    // La columna jsonb ya existia; banva1 nunca la habia escrito.
+    factura_original: forense ? {
+      ocr_text: forense.ocrText || null,
+      parsed_crudo: forense.parsedCrudo || null,
+      lineas_final: (productos || []).map(p => ({
+        sku: p.sku || "", sku_original: p.skuOriginal || "", match_type: p.matchType || "",
+        nombre_factura: p.nombre || "", nombre_dict: p.nombreDict || "",
+        cantidad: p.cantidad || 0, costo: p.costo || 0, codigo_ml: p.codigoML || "",
+      })),
+      descartadas: (productos || []).filter(p => !(p.sku && p.cantidad > 0)).map(p => ({
+        sku: p.sku || "", nombre_factura: p.nombre || "", cantidad: p.cantidad || 0, costo: p.costo || 0,
+      })),
+    } : null,
   }).select("id").single();
 
   if (recErr) {
@@ -590,6 +606,13 @@ function App() {
   // 535410). Con esta marca la tarjeta de cuadre pide el neto A MANO y el envio
   // al WMS queda bloqueado hasta que el operador lo escriba.
   const [netoManual, setNetoManual] = useState(false);
+  // ---- Candados de integridad (locks.js) ----
+  // Texto OCR crudo y JSON crudo del modelo, tal como llegaron del backend.
+  // Alimentan los candados (el diff de codigos necesita el ocrText) y el
+  // registro forense factura_original. Hasta este PR el frontend los DESCARTABA:
+  // por eso el incidente 546747 solo pudo reconstruirse re-corriendo el OCR.
+  const [ocrTextRaw, setOcrTextRaw] = useState("");
+  const [parsedCrudo, setParsedCrudo] = useState(null);
   // ---- Vínculo con Orden de Compra (OC) ----
   // Datos crudos leídos por OCR (Task 1 de api/process.js). Van SIEMPRE al INSERT
   // como auditoría, se vincule o no una OC. ref_fvta además tiene UNIQUE parcial:
@@ -993,6 +1016,10 @@ function App() {
 
       // Parse Document AI response (already structured)
       const parsed = data.parsed;
+      // Materia prima de los candados + forense. El backend siempre devolvio
+      // ocrText; el frontend lo botaba.
+      setOcrTextRaw(data.ocrText || "");
+      setParsedCrudo(parsed || null);
 
       // Debug: log raw entities to browser console
       if (data.debugEntities) {
@@ -1084,18 +1111,50 @@ function App() {
       setStep("review");
       
     } catch (err) {
-      setError(err.message);
+      // Distinguir "la foto salio mala" (el operador lo resuelve re-escaneando)
+      // de "el motor esta caido" (key/creditos/API: re-escanear NO lo arregla y
+      // el operador perdia tiempo intentando). El segundo caso pide avisar.
+      const esFallaDeSistema = /no configurada|api key|api error|401|402|429|credit|cupo|conectar|fetch failed|se cort/i.test(err.message || "");
+      setError(esFallaDeSistema
+        ? "🔧 Esto NO es problema de la foto — avisale a Vicente tal cual:\n" + err.message
+        : err.message);
       setStep("upload");
     } finally {
       setProcessing(false);
     }
   }, [invoiceImageBase64, dictionary]);
 
+  // ---- Candados de integridad (derivados del estado VIVO) ----
+  // Se recalculan con cada edicion del operador — el duplicado del incidente
+  // 546747 NO venia del modelo: nacio cuando el operador reparo a mano la linea
+  // "Sin ML". Un snapshot tomado al escanear jamas lo habria visto. Por eso es
+  // useMemo sobre extractedProducts y ADEMAS se re-evalua dentro de
+  // generateLabels/sendToWMS (cinturon y tirantes).
+  const candados = React.useMemo(() => {
+    if (!window.BanvaLocks) return { bloqueos: [], sinLocks: true };
+    try {
+      return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw });
+    } catch (e) {
+      // Si el modulo revienta, no se finge que todo esta bien: se avisa.
+      return { bloqueos: [{ tipo: "locks_error", mensaje: "Los candados de integridad fallaron (" + (e.message || e) + "). Avisale a Vicente antes de enviar." }] };
+    }
+  }, [extractedProducts, ocrTextRaw]);
+
   // ---- Generate Labels ----
   const generateLabels = useCallback(async () => {
     setProcessing(true);
     setProcessingStatus("Generando etiquetas...");
-    
+
+    // En el incidente 546747 las 4 etiquetas fantasma se imprimieron ANTES de
+    // que nadie pudiera notar nada: la impresion corre antes que el envio y no
+    // tenia ningun candado. Mismos bloqueos que el envio, aca tambien.
+    if (candados.bloqueos.length > 0) {
+      setError("La lectura de esta factura tiene problemas — re-escaneala (estira el papel, evita sombras) antes de imprimir:\n• " +
+        candados.bloqueos.map(b => b.mensaje).join("\n• "));
+      setProcessing(false);
+      return;
+    }
+
     const validProducts = extractedProducts.filter(p => p.codigoML && p.cantidad > 0);
     
     if (validProducts.length === 0) {
@@ -1111,7 +1170,7 @@ function App() {
     setLabelPages(pages);
     setStep("labels");
     setProcessing(false);
-  }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators]);
+  }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators, candados]);
 
   // ---- Send to WMS ----
   const [wmsResult, setWmsResult] = useState(null);
@@ -1155,6 +1214,22 @@ function App() {
       setWmsStatus("error");
       return;
     }
+    // Candados de integridad, re-evaluados AQUI sobre el estado final (no el
+    // memo: cinturon y tirantes contra estado rancio). Un corrimiento conserva
+    // la suma exacta, asi que el cuadre de arriba es ciego a esta clase de
+    // error — estos candados son la unica defensa (incidente 546747).
+    if (window.BanvaLocks) {
+      const cand = (() => {
+        try { return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw }); }
+        catch (e) { return { bloqueos: [{ mensaje: "Los candados de integridad fallaron (" + (e.message || e) + ")." }] }; }
+      })();
+      if (cand.bloqueos.length > 0) {
+        setWmsError("Lectura inconsistente — RE-ESCANEÁ la factura (estirá el papel, evitá sombras). No corrijas estas líneas a mano:\n• " +
+          cand.bloqueos.map(b => b.mensaje).join("\n• "));
+        setWmsStatus("error");
+        return;
+      }
+    }
     setWmsStatus("sending"); setWmsError("");
     try {
       // Tres reglas de cabecera, según qué tan confiable es cada dato:
@@ -1193,14 +1268,15 @@ function App() {
           ? ((refOcOcr ? "OC-" + refOcOcr + " · " : "") + ocValidResult.resultado)
           : null,
       };
-      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos, null, ocLink);
+      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos, null, ocLink,
+        { ocrText: ocrTextRaw, parsedCrudo: parsedCrudo });
       setWmsResult(result);
       setWmsStatus("sent");
     } catch (err) {
       setWmsError(err.message);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo]);
 
   // ---- Último costo conocido por SKU (de la última recepción) ----
   // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
@@ -2506,6 +2582,26 @@ function App() {
               </div>
             )}
 
+            {/* Candados de integridad: la lectura vino corrida/incompleta.
+                Bloquea impresión Y envío. La instrucción es re-escanear, no
+                "arreglar a mano": el incidente 546747 entró exactamente así —
+                el operador reparó la línea que la app le marcó y fabricó un
+                duplicado perfecto. */}
+            {candados.bloqueos.length > 0 && (
+              <div style={{...styles.warningCard, border: "1px solid rgba(239,68,68,0.5)", background: "rgba(239,68,68,0.08)"}}>
+                <div style={{fontSize: 24}}>🛑</div>
+                <div>
+                  <strong style={{color: "#EF4444"}}>La lectura de esta factura tiene {candados.bloqueos.length} problema(s) — re-escaneala</strong>
+                  <ul style={{margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#FCA5A5"}}>
+                    {candados.bloqueos.map((b, i) => <li key={i} style={{marginBottom: 4}}>{b.mensaje}</li>)}
+                  </ul>
+                  <p style={{margin: "6px 0 0", fontSize: 12, color: "#F87171", fontWeight: 600}}>
+                    Estirá el papel, evitá sombras y sacá la foto de nuevo. NO corrijas estas líneas a mano: si la lectura vino corrida, "arreglarla" solo esconde el error.
+                  </p>
+                </div>
+              </div>
+            )}
+
             {/* Product list */}
             <div style={styles.productList}>
               {extractedProducts.map((p, idx) => (
@@ -2529,6 +2625,7 @@ function App() {
                       {p.needsVariantSelection && <span style={{...styles.badgeWarning, background: "rgba(239,68,68,0.15)", color: "#EF4444", cursor: "pointer"}} onClick={() => setShowVariantModal(true)}>⚠ Elegir formato</span>}
                       {!p.matched && !p.needsVariantSelection && <span style={styles.badgeWarning}>Sin ML</span>}
                       {p.matched && p.matchType === "ocr-fuzzy" && <span style={{...styles.badgeSuccess, background: "rgba(59,130,246,0.12)", color: "#3B82F6"}} title={"OCR corregido: " + (p.skuOriginal || "")}>🔧 Corregido</span>}
+                      {p.matched && p.matchType === "manual" && <span style={{...styles.badgeSuccess, background: "rgba(139,92,246,0.12)", color: "#8B5CF6"}} title="Este producto se asignó a mano con el buscador — no venía legible en el escaneo">✎ Manual</span>}
                       {p.matched && p.etiquetaImpresa !== false && <span style={styles.badgeSuccess}>✓ ML</span>}
                       {p.isPack && <span style={{...styles.badgeSuccess, background: "rgba(245,158,11,0.12)", color: "#F59E0B"}}>📦 Pack x{p.cantPack}</span>}
                       {p.altCount > 1 && !p.needsVariantSelection && <span style={{...styles.badgeSuccess, background: "rgba(139,92,246,0.12)", color: "#8B5CF6", cursor: "pointer"}} onClick={() => {
@@ -2674,12 +2771,14 @@ function App() {
 
             <div style={{display: "flex", gap: 10, marginTop: 10}}>
               <button style={styles.secondaryBtn} onClick={() => setStep("upload")}>← Volver</button>
-              <button 
-                style={{...styles.primaryBtn, flex: 1}}
+              <button
+                style={{...styles.primaryBtn, flex: 1, ...(candados.bloqueos.length > 0 ? {background: "#1a1a1a", color: "#666", border: "1px solid #333", cursor: "not-allowed"} : {})}}
                 onClick={generateLabels}
-                disabled={processing}
+                disabled={processing || candados.bloqueos.length > 0}
               >
-                🏷️ Generar Etiquetas ({extractedProducts.filter(p => p.codigoML).reduce((s, p) => s + p.cantidad, 0)} etiquetas)
+                {candados.bloqueos.length > 0
+                  ? "🚫 Re-escaneá la factura antes de imprimir (" + candados.bloqueos.length + " problema(s) de lectura)"
+                  : "🏷️ Generar Etiquetas (" + extractedProducts.filter(p => p.codigoML).reduce((s, p) => s + p.cantidad, 0) + " etiquetas)"}
               </button>
             </div>
 
@@ -2696,7 +2795,8 @@ function App() {
                   // obligatorio (es lo único que detecta productos faltantes).
                   const esFlujoManual = folioFactura === "RAPIDO" || folioFactura === "LISTA";
                   const netoFaltante = !!invoiceImage && !esFlujoManual && netoCab <= 0;
-                  const blocked = sinCostos || desfase || netoFaltante;
+                  const conCandados = candados.bloqueos.length > 0;
+                  const blocked = sinCostos || desfase || netoFaltante || conCandados;
                   const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
                   return (
                     <>
@@ -2709,7 +2809,7 @@ function App() {
                         disabled={blocked}
                         style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: blocked ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: blocked ? "#666" : "#fff", fontSize: 14, fontWeight: 700, border: blocked ? "1px solid #333" : "none", cursor: blocked ? "not-allowed" : "pointer", opacity: blocked ? 0.7 : 1}}
                       >
-                        {netoFaltante ? "🚫 Escribí el neto de la factura (tarjeta amarilla de arriba)" : sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
+                        {conCandados ? "🚫 Re-escaneá la factura (" + candados.bloqueos.length + " problema(s) de lectura — tarjeta roja de arriba)" : netoFaltante ? "🚫 Escribí el neto de la factura (tarjeta amarilla de arriba)" : sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
                       </button>
                     </>
                   );
