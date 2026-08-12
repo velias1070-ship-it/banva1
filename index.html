@@ -291,7 +291,10 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
   // 3-pre. Payload de líneas SIN recepcion_id (la RPC atómica lo resuelve; el
   // camino legacy se lo agrega). Mismo filtro de siempre.
   const lineasPayload = productos.filter(p => p.sku && p.cantidad > 0).map(p => ({
-    sku: (p.sku || "").toUpperCase(),
+    // trim: espejo de la normalizacion upper(trim(...)) de la RPC — sin el,
+    // un SKU tipeado con espacios se guarda trimeado y el reintento identico
+    // caeria en "datos DISTINTOS" (hallazgo auditoria ronda 3).
+    sku: (p.sku || "").trim().toUpperCase(),
     codigo_ml: p.codigoML || "",
     nombre: p.nombreDict || p.nombre || p.sku,
     qty_factura: p.cantidad || 0,
@@ -323,6 +326,7 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
   let recId = null;
   let ramaCreacion = null;
   let usoLegacy = false;
+  let lineasCreadas = lineasPayload.length;
   {
     const { data: rpcRes, error: rpcErr } = await sb.rpc("crear_recepcion_etiquetas", {
       p_cabecera: cabecera,
@@ -332,6 +336,9 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     if (!rpcErr && rpcRes && rpcRes.recepcion_id) {
       recId = rpcRes.recepcion_id;
       ramaCreacion = rpcRes.rama || "creada";
+      // Ancla de realidad: lo que reporta la RPC (ROW_COUNT real / lineas de
+      // la recepcion ya existente), no lo que el payload prometia.
+      if (rpcRes.lineas != null) lineasCreadas = rpcRes.lineas;
     } else if (rpcErr && (rpcErr.code === "PGRST202" || /Could not find the function/i.test(rpcMsg))) {
       // RPC no desplegada aún: camino legacy (ventana de deploy). SOLO estas
       // dos firmas significan "la función no existe" — cualquier otro error de
@@ -349,20 +356,21 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
       // Duplicado real contra una recepción VIVA (la RPC ya excluye anuladas
       // y ya intentó reanudar/idempotencia): mensaje limpio con folio/fecha.
       const m = rpcMsg.match(/\(folio ([^,]+), creada ([^,]+), \d+ linea/);
-      const distintas = /lineas DISTINTAS/i.test(rpcMsg);
+      const distintas = /datos DISTINTOS/i.test(rpcMsg);
       const e = new Error(
         `Esta factura (FVTA_${nz(oc.ref_fvta) || "?"}) ya fue cargada antes` +
         (m ? ` — el ${m[2]}` + (m[1] ? ` (folio ${m[1]})` : "") : "") +
         (distintas
-          ? ", y con LÍNEAS DISTINTAS a las de este envío. Revisala en el WMS antes de reenviar."
+          ? ", y con DATOS DISTINTOS a los de este envío (líneas o totales). Revisala en el WMS antes de reenviar."
           : "; no se registra de nuevo.") +
         " Si es un error, avisá con el folio."
       );
       e.esDupFvta = true;
       throw e;
     } else if (rpcErr && /lock timeout|55P03|deadlock/i.test(rpcMsg)) {
-      // Advisory lock por FVTA: otra pestaña está cargando ESTA factura.
-      throw new Error("Otra pestaña está cargando esta misma factura en este momento. Esperá unos segundos y apretá Reintentar.");
+      // Advisory lock por FVTA o lock de fila: alguien más está trabajando
+      // sobre esta factura (otra pestaña, o el WMS ubicando/anulando).
+      throw new Error("Otra pestaña u otro equipo están trabajando sobre esta misma factura en este momento. Esperá unos segundos y apretá Reintentar.");
     } else if (rpcErr) {
       throw new Error("Error creando recepción: " + rpcErr.message);
     } else {
@@ -430,7 +438,7 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     }
   }
 
-  return { recId, lineas: lineasPayload.length, rama: ramaCreacion, imagenUrl, proveedor: proveedorFinal, proveedor_id, fuenteProveedor: fuente, inferenciaInfo };
+  return { recId, lineas: lineasCreadas, rama: ramaCreacion, imagenUrl, proveedor: proveedorFinal, proveedor_id, fuenteProveedor: fuente, inferenciaInfo };
 }
 
 // ============================================================
@@ -683,6 +691,9 @@ function App() {
   const [proveedorFactura, setProveedorFactura] = useState("");
   const [wmsStatus, setWmsStatus] = useState(""); // "", "sending", "sent", "error"
   const [wmsError, setWmsError] = useState("");
+  // true = el "error" es un duplicado de factura (FVTA ya registrada), no una
+  // falla tecnica: se pinta distinto para que no parezca caida de red.
+  const [wmsErrorEsDup, setWmsErrorEsDup] = useState(false);
   const [costoNeto, setCostoNeto] = useState(0);
   const [iva, setIva] = useState(0);
   const [costoBruto, setCostoBruto] = useState(0);
@@ -1134,7 +1145,7 @@ function App() {
       // Total no leido = señal de foto cortada abajo o de OCR incompleto.
       // Se pide a mano en la tarjeta de cuadre; el envio queda bloqueado hasta ahi.
       setNetoManual(!(Number(parsed.costo_neto) > 0));
-      setWmsStatus(""); setWmsError("");
+      setWmsStatus(""); setWmsError(""); setWmsErrorEsDup(false);
       // Referencias de OC leídas por OCR (Task 1). Retrocompatibles: si el modelo
       // no las trae (facturas viejas / no-Idetex) quedan "" y el flujo sigue igual.
       setRefOcOcr((parsed.referencia_oc || "").toString().trim());
@@ -1359,7 +1370,7 @@ function App() {
         return;
       }
     }
-    setWmsStatus("sending"); setWmsError("");
+    setWmsStatus("sending"); setWmsError(""); setWmsErrorEsDup(false);
     try {
       // Tres reglas de cabecera, según qué tan confiable es cada dato:
       // 1. Sin factura (RAPIDO/LISTA): suma de líneas, sin IVA (no inferimos 19%).
@@ -1410,6 +1421,7 @@ function App() {
       setWmsStatus("sent");
     } catch (err) {
       setWmsError(err.message);
+      setWmsErrorEsDup(!!err.esDupFvta);
       setWmsStatus("error");
     }
   }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo, skusCatalogo, candadosOverride]);
@@ -3056,9 +3068,13 @@ function App() {
                   </div>
                 )}
                 {wmsStatus === "error" && (
-                  <div style={{padding: "10px 14px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 8}}>
-                    <div style={{color: "#EF4444", fontWeight: 700, fontSize: 12}}>❌ Error: {wmsError}</div>
-                    <button onClick={sendToWMS} style={{marginTop: 6, padding: "6px 14px", borderRadius: 6, background: "#222", color: "#EF4444", fontSize: 11, fontWeight: 600, border: "1px solid #333", cursor: "pointer"}}>Reintentar</button>
+                  <div style={{padding: "10px 14px", background: wmsErrorEsDup ? "rgba(245,158,11,0.1)" : "rgba(239,68,68,0.1)", border: wmsErrorEsDup ? "1px solid rgba(245,158,11,0.3)" : "1px solid rgba(239,68,68,0.3)", borderRadius: 8}}>
+                    <div style={{color: wmsErrorEsDup ? "#F59E0B" : "#EF4444", fontWeight: 700, fontSize: 12}}>
+                      {wmsErrorEsDup ? "🔁 Factura ya registrada: " : "❌ Error: "}{wmsError}
+                    </div>
+                    {!wmsErrorEsDup && (
+                      <button onClick={sendToWMS} style={{marginTop: 6, padding: "6px 14px", borderRadius: 6, background: "#222", color: "#EF4444", fontSize: 11, fontWeight: 600, border: "1px solid #333", cursor: "pointer"}}>Reintentar</button>
+                    )}
                   </div>
                 )}
               </div>
@@ -3146,7 +3162,7 @@ function App() {
                 setLabelPages([]);
                 setFolioFactura("");
                 setProveedorFactura("");
-                setWmsStatus(""); setWmsError("");
+                setWmsStatus(""); setWmsError(""); setWmsErrorEsDup(false);
                 setCostoNeto(0); setIva(0); setCostoBruto(0);
                 setNetoManual(false);
                 setRefOcOcr(""); setRefOvt(""); setRefFvta("");
