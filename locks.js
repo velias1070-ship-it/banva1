@@ -259,6 +259,16 @@
     const enLinea = new Set(skusLinea);
     const out = [];
     candidatos.forEach(function (cod) {
+      // Fragmento literal de un SKU con línea = pedazo que el pliegue/borde
+      // cortó (caso real "XW26PMVC": prefijo común de 4 plumones presentes) —
+      // NO es un producto faltante. Un omitido de verdad trae su código
+      // completo (p.ej. TXW26QLVD20AZ), que no es substring de ningún otro.
+      let esFragmento = false;
+      for (const s of skusLinea) {
+        if (s.indexOf(cod) !== -1) { esFragmento = true; break; }
+      }
+      if (esFragmento) return;
+
       let minLinea = 3;
       for (const s of skusLinea) {
         const d = levenshtein(cod, s, 2);

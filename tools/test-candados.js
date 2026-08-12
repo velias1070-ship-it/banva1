@@ -397,6 +397,37 @@ Solución de Factura Electrónica de: www.acepta.com`;
 }
 
 // ------------------------------------------------------------
+// CASO 12 — Fragmento cortado por el pliegue (caso real 12-ago: "XW26PMVC",
+// prefijo comun de los 4 plumones PRESENTES) no debe alarmar; un producto
+// OMITIDO de verdad (codigo completo sin linea) debe seguir alarmando aunque
+// el fragmento tambien este en el texto.
+// ------------------------------------------------------------
+console.log("CASO 12 — fragmento de pliegue vs producto omitido:");
+{
+  const plumones = [
+    linea("TXW26PMVC15CR", "Plumon VL Corduroy Sherpa 15P Crema", 4, 14000),
+    linea("TXW26PMVC20AZ", "Plumon VL Corduroy Sherpa 20P Azul", 8, 16000),
+    linea("TXW26PMVC25AZ", "Plumon VL Corduroy Sherpa 25P Azul", 8, 18000),
+    linea("TXW26PMVC25TE", "Plumon VL Corduroy Sherpa 25P Terracota", 8, 18000),
+  ];
+  const resFragmento = Locks.evaluarCandados({
+    productos: plumones,
+    ocrText: "XW26PMVC\nTXW26PMVC15CR\nTXW26PMVC20AZ\nTXW26PMVC25AZ\nTXW26PMVC25TE",
+    skusCatalogo: Object.keys(DICT),
+  });
+  check("fragmento XW26PMVC con sus 4 lineas presentes = 0 bloqueos",
+    resFragmento.bloqueos.length === 0, JSON.stringify(resFragmento.bloqueos.map(b => b.mensaje)));
+
+  const resOmitido = Locks.evaluarCandados({
+    productos: plumones,
+    ocrText: "XW26PMVC\nTXW26PMVC15CR\nTXW26QLVD20AZ TXW26QLVD20AZ",
+    skusCatalogo: Object.keys(DICT),
+  });
+  check("producto omitido completo (Dobby) sigue alarmando aunque haya fragmento",
+    resOmitido.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "TXW26QLVD20AZ"));
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");
