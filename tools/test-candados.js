@@ -428,6 +428,28 @@ console.log("CASO 12 — fragmento de pliegue vs producto omitido:");
 }
 
 // ------------------------------------------------------------
+// CASO 13 — REGRESION del descarte de fragmentos (hallazgo auditoria): un SKU
+// corto que es prefijo de su variante pack (RAPAC50X70AFA ⊂ RAPAC50X70AFAX2,
+// par REAL del catalogo con historial) y viene OMITIDO debe seguir alarmando
+// — la regla de fragmentos solo aplica a pedazos que NO son SKUs de catalogo.
+// ------------------------------------------------------------
+console.log("CASO 13 — SKU corto omitido no se tapa con su variante pack:");
+{
+  const catalogoConPacks = Object.keys(DICT).concat(["RAPAC50X70AFA", "RAPAC50X70AFAX2"]);
+  const soloPack = [
+    linea("RAPAC50X70AFAX2", "Pack 2 Almohadas AF 50x70", 10, 6900, { nombreDict: "Pack 2 Almohadas AF 50x70", matched: true }),
+  ];
+  const res = Locks.evaluarCandados({
+    productos: soloPack,
+    ocrText: "RAPAC50X70AFAX2 RAPAC50X70AFAX2\nRAPAC50X70AFA RAPAC50X70AFA",
+    skusCatalogo: catalogoConPacks,
+  });
+  check("RAPAC50X70AFA omitido dispara aunque el pack este presente",
+    res.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "RAPAC50X70AFA"),
+    JSON.stringify(res.bloqueos.map(b => b.mensaje)));
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");

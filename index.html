@@ -288,52 +288,81 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     } : null,
   };
 
-  // 2a. REANUDAR una cabecera huérfana propia (bug recepción-huérfana,
-  // caso real 546747 12-ago 17:14): si un envío anterior creó la cabecera y la
-  // red se cortó ANTES de las líneas, quedó una recepción CREADA con 0 líneas
-  // ocupando el cupo FVTA. Reintentar debe RETOMARLA y completar solo las
-  // líneas — crear otra choca 23505 contra la propia huérfana y el operador
-  // queda atrapado. Solo con FVTA (llave única de la factura), solo cabeceras
-  // nuestras, CREADA y sin líneas. Regla 4: se expone `reanudada` en el return.
+  // 3-pre. Payload de líneas SIN recepcion_id (la RPC atómica lo resuelve; el
+  // camino legacy se lo agrega). Mismo filtro de siempre.
+  const lineasPayload = productos.filter(p => p.sku && p.cantidad > 0).map(p => ({
+    sku: (p.sku || "").toUpperCase(),
+    codigo_ml: p.codigoML || "",
+    nombre: p.nombreDict || p.nombre || p.sku,
+    qty_factura: p.cantidad || 0,
+    qty_recibida: 0,
+    qty_etiquetada: 0,
+    qty_ubicada: 0,
+    estado: "PENDIENTE",
+    requiere_etiqueta: !!(p.codigoML),
+    etiqueta_impresa: p.etiquetaImpresa !== false,
+    tiene_variantes: (p.altCount || 0) > 1,
+    sku_venta: p.skuVenta || "",
+    costo_unitario: p.costo || 0,
+    notas: p.etiquetaImpresa === false
+      ? "Sin etiqueta - SKU con multiples formatos de venta"
+      : (p.altCount > 1 ? "SKU con " + p.altCount + " formatos de venta" : ""),
+    operario_conteo: "",
+    operario_etiquetado: "",
+    operario_ubicacion: "",
+  }));
+
+  // 2b. CREACIÓN ATÓMICA (fix recepción-huérfana, caso real 12-ago 17:14):
+  // cabecera + líneas en UNA transacción vía RPC crear_recepcion_etiquetas
+  // (banvabodega, SECURITY DEFINER). Mata de raíz: la huérfana por corte de
+  // red entre los dos inserts, el duplicado por reintento ambiguo ("Failed to
+  // fetch" con commit aplicado → la RPC responde rama 'ya_estaba' idempotente)
+  // y la carrera de dos pestañas (advisory lock por FVTA dentro de la RPC).
+  // Si la RPC aún no está desplegada en el entorno, se DEGRADA al camino
+  // legacy de dos pasos (el histórico) — Regla 4: `rama` viaja en el return.
   let recId = null;
-  let reanudada = false;
-  if (nz(oc.ref_fvta)) {
-    try {
-      const { data: prev, error: prevErr } = await sb.from("recepciones")
-        .select("id, estado, created_by")
-        .eq("ref_fvta", nz(oc.ref_fvta))
-        .neq("estado", "ANULADA")
-        .limit(1)
-        .maybeSingle();
-      if (prevErr) console.warn("[reanudar] lookup falló:", prevErr.message);
-      if (prev && prev.estado === "CREADA" && prev.created_by === "App Etiquetas") {
-        const { count: nPrev, error: cntErr } = await sb.from("recepcion_lineas")
-          .select("id", { count: "exact", head: true })
-          .eq("recepcion_id", prev.id);
-        if (!cntErr && nPrev === 0) {
-          // Adoptar: refrescar la cabecera con los datos de ESTE envío (misma
-          // factura por FVTA — los costos/forense/OC de ahora son los vigentes).
-          let { error: updErr } = await sb.from("recepciones").update(cabecera).eq("id", prev.id);
-          if (updErr && (updErr.code === "PGRST204" || /factura_original/i.test(String(updErr.message || "")))) {
-            const sinForense = { ...cabecera };
-            delete sinForense.factura_original;
-            ({ error: updErr } = await sb.from("recepciones").update(sinForense).eq("id", prev.id));
-          }
-          if (updErr) throw new Error("Error retomando la recepción sin líneas: " + updErr.message);
-          recId = prev.id;
-          reanudada = true;
-          console.log(`[reanudar] cabecera huérfana ${prev.id} retomada (FVTA ${nz(oc.ref_fvta)})`);
-        }
-      }
-    } catch (e) {
-      if (recId) throw e; // la adopción ya había tomado la cabecera: no seguir a crear otra
-      console.warn("[reanudar] fallo no fatal, sigo al insert normal:", e && e.message);
+  let ramaCreacion = null;
+  let usoLegacy = false;
+  {
+    let { data: rpcRes, error: rpcErr } = await sb.rpc("crear_recepcion_etiquetas", {
+      p_cabecera: cabecera,
+      p_lineas: lineasPayload,
+    });
+    // Entorno sin la columna factura_original: reintentar la RPC sin forense
+    // (misma degradación que ya tiene el camino legacy).
+    if (rpcErr && /factura_original/i.test(String(rpcErr.message || ""))) {
+      const sinForense = { ...cabecera };
+      delete sinForense.factura_original;
+      ({ data: rpcRes, error: rpcErr } = await sb.rpc("crear_recepcion_etiquetas", {
+        p_cabecera: sinForense,
+        p_lineas: lineasPayload,
+      }));
+    }
+    if (!rpcErr && rpcRes && rpcRes.recepcion_id) {
+      recId = rpcRes.recepcion_id;
+      ramaCreacion = rpcRes.rama || "creada";
+    } else if (rpcErr && (rpcErr.code === "PGRST202" || /does not exist|Could not find the function/i.test(String(rpcErr.message || "")))) {
+      // RPC no desplegada aún: camino legacy (ventana de deploy).
+      usoLegacy = true;
+      console.warn("[crear_recepcion] RPC atómica no disponible, usando camino legacy de dos pasos");
+    } else if (rpcErr && /ya tiene una recepcion activa/i.test(String(rpcErr.message || ""))) {
+      // Duplicado real contra una recepción VIVA (la RPC ya excluye anuladas
+      // y ya intentó reanudar/idempotencia): mensaje con la info que trae.
+      const e = new Error(
+        `Esta factura (FVTA_${nz(oc.ref_fvta) || "?"}) ya fue cargada antes; no se registra de nuevo. ` +
+        String(rpcErr.message || "").replace(/^[^:]*: ?/, "") +
+        " Si es un error, avisá con el folio."
+      );
+      e.esDupFvta = true;
+      throw e;
+    } else if (rpcErr) {
+      throw new Error("Error creando recepción: " + rpcErr.message);
     }
   }
 
   let rec = null, recErr = null;
-  if (!recId) {
-    ({ data: rec, error: recErr } = await sb.from("recepciones").insert(cabecera).select("id").single());
+  if (usoLegacy) {
+  ({ data: rec, error: recErr } = await sb.from("recepciones").insert(cabecera).select("id").single());
   // En entornos donde la columna factura_original no exista (branch/staging
   // viejo), PostgREST aborta el insert COMPLETO (PGRST204). El forense es
   // deseable; poder recibir mercaderia es obligatorio: reintenta sin el campo.
@@ -376,75 +405,20 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     throw new Error("Error creando recepción: " + recErr.message);
     }
     recId = rec.id;
-  }
+    ramaCreacion = "creada_legacy";
 
-  // 3. Create líneas
-  const lineas = productos.filter(p => p.sku && p.cantidad > 0).map(p => ({
-    recepcion_id: recId,
-    sku: (p.sku || "").toUpperCase(),
-    codigo_ml: p.codigoML || "",
-    nombre: p.nombreDict || p.nombre || p.sku,
-    qty_factura: p.cantidad || 0,
-    qty_recibida: 0,
-    qty_etiquetada: 0,
-    qty_ubicada: 0,
-    estado: "PENDIENTE",
-    requiere_etiqueta: !!(p.codigoML),
-    etiqueta_impresa: p.etiquetaImpresa !== false,
-    tiene_variantes: (p.altCount || 0) > 1,
-    sku_venta: p.skuVenta || "",
-    costo_unitario: p.costo || 0,
-    notas: p.etiquetaImpresa === false
-      ? "Sin etiqueta - SKU con multiples formatos de venta"
-      : (p.altCount > 1 ? "SKU con " + p.altCount + " formatos de venta" : ""),
-    operario_conteo: "",
-    operario_etiquetado: "",
-    operario_ubicacion: "",
-  }));
-
-  if (lineas.length > 0) {
-    // Reintento automático: el bulk insert es UNA sentencia (o entran todas las
-    // líneas o ninguna), así que reintentarlo ante un corte de red es seguro.
-    // "Failed to fetch" puede llegar como error devuelto O como excepción según
-    // la versión de supabase-js: se capturan ambos. (Bug recepción-huérfana:
-    // la cabecera ya existe; sin esto, un parpadeo de red la dejaba coja.)
-    let linErr = null;
-    for (let intento = 1; intento <= 3; intento++) {
-      try {
-        const { error } = await sb.from("recepcion_lineas").insert(lineas);
-        linErr = error || null;
-      } catch (e) {
-        linErr = e;
-      }
-      if (!linErr) break;
-      console.warn(`[líneas] intento ${intento}/3 falló: ${linErr.message}`);
-      if (intento < 3) await new Promise(r => setTimeout(r, 1000 * intento));
-    }
-    if (linErr) throw new Error(
-      "Las líneas no se pudieron guardar (¿corte de red?). La recepción quedó CREADA sin líneas — " +
-      "apretá Reintentar: la app la va a RETOMAR y completar sin duplicarla. Detalle: " + linErr.message
-    );
-
-    // Verificación anti-carrera (dos pestañas retomando la misma huérfana a la
-    // vez): si la recepción quedó con MÁS líneas de las de este envío, decirlo
-    // fuerte — nada de duplicados silenciosos (Regla 1).
-    try {
-      const { count: nFinal, error: vErr } = await sb.from("recepcion_lineas")
-        .select("id", { count: "exact", head: true })
-        .eq("recepcion_id", recId);
-      if (!vErr && typeof nFinal === "number" && nFinal > lineas.length) {
-        throw new Error(
-          `La recepción quedó con ${nFinal} líneas y esta factura trae ${lineas.length} (¿dos pestañas enviando a la vez?). ` +
-          "NO la proceses: avisá con el folio para limpiar las líneas duplicadas."
-        );
-      }
-    } catch (e) {
-      if (/dos pestañas/.test(String(e && e.message))) throw e;
-      console.warn("[líneas] verificación de conteo no disponible:", e && e.message);
+    // 3. Create líneas (solo camino legacy: la RPC atómica ya las insertó)
+    const lineas = lineasPayload.map(l => ({ recepcion_id: recId, ...l }));
+    if (lineas.length > 0) {
+      const { error: linErr } = await sb.from("recepcion_lineas").insert(lineas);
+      if (linErr) throw new Error(
+        "Error creando líneas: " + linErr.message +
+        " — la recepción quedó CREADA sin líneas; apretá Reintentar (con la RPC atómica desplegada esto no puede pasar)."
+      );
     }
   }
 
-  return { recId, lineas: lineas.length, reanudada, imagenUrl, proveedor: proveedorFinal, proveedor_id, fuenteProveedor: fuente, inferenciaInfo };
+  return { recId, lineas: lineasPayload.length, rama: ramaCreacion, imagenUrl, proveedor: proveedorFinal, proveedor_id, fuenteProveedor: fuente, inferenciaInfo };
 }
 
 // ============================================================
@@ -3038,6 +3012,16 @@ function App() {
                 {wmsStatus === "sent" && (
                   <div style={{padding: "10px 14px", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 8, textAlign: "center"}}>
                     <div style={{color: "#22C55E", fontWeight: 700, fontSize: 13}}>✅ Recepción creada en WMS</div>
+                    {wmsResult && wmsResult.rama === "reanudada" && (
+                      <div style={{color: "#F59E0B", fontSize: 11, marginTop: 4}}>
+                        ↻ Se retomó la recepción que había quedado sin líneas por el corte anterior — no se creó una nueva.
+                      </div>
+                    )}
+                    {wmsResult && wmsResult.rama === "ya_estaba" && (
+                      <div style={{color: "#F59E0B", fontSize: 11, marginTop: 4}}>
+                        ↻ Esta factura ya estaba registrada completa: el reintento fue seguro, no se duplicó nada.
+                      </div>
+                    )}
                     {wmsResult && wmsResult.proveedor && (
                       <div style={{color: "#ccc", fontSize: 11, marginTop: 4}}>
                         Proveedor: <strong>{wmsResult.proveedor}</strong>

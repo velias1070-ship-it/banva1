@@ -235,13 +235,18 @@
   function checkCodigosFactura(ocrText, productos, skusCatalogo) {
     if (!ocrText) return [];
     const skusLinea = [];
+    // Base del descarte de fragmentos: SOLO sku y skuVenta reales. skuOriginal
+    // (texto crudo del OCR) sigue contando para la cobertura por distancia,
+    // pero un token pegoteado ahi no debe tapar candidatos como "fragmento".
+    const skusPresentes = [];
     (productos || []).forEach(function (p) {
       if (!p) return;
-      const s = normSku(p.sku); if (s) skusLinea.push(s);
-      const sv = normSku(p.skuVenta); if (sv) skusLinea.push(sv);
+      const s = normSku(p.sku); if (s) { skusLinea.push(s); skusPresentes.push(s); }
+      const sv = normSku(p.skuVenta); if (sv) { skusLinea.push(sv); skusPresentes.push(sv); }
       const so = normSku(p.skuOriginal); if (so) skusLinea.push(so);
     });
     const catalogo = (skusCatalogo || []).map(normSku).filter(Boolean);
+    const catalogoSet = new Set(catalogo);
     const cacheKey = String(ocrText).length + "|" + String(ocrText).slice(0, 80) +
       "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length;
     if (cacheKey === _codCacheKey) return _codCacheVal;
@@ -259,13 +264,19 @@
     const enLinea = new Set(skusLinea);
     const out = [];
     candidatos.forEach(function (cod) {
-      // Fragmento literal de un SKU con línea = pedazo que el pliegue/borde
-      // cortó (caso real "XW26PMVC": prefijo común de 4 plumones presentes) —
-      // NO es un producto faltante. Un omitido de verdad trae su código
-      // completo (p.ej. TXW26QLVD20AZ), que no es substring de ningún otro.
+      // Fragmento cortado por el pliegue: PEDAZO ESTRICTO (s !== cod) de un
+      // SKU presente Y que NO sea un SKU legitimo del catalogo. La segunda
+      // condicion es vital: el catalogo real tiene familias donde un SKU es
+      // prefijo de su variante pack (RAPAC50X70AFA ⊂ ...X2, LICAAFVIS5746 ⊂
+      // ...X1, TXALMILLVIS46 ⊂ ...X2 — con historial real de recepcion): un
+      // producto corto OMITIDO quedaria "cubierto" por el pack presente. El
+      // fragmento real ("XW26PMVC") no existe en el catalogo — se distingue.
+      const esSkuDeCatalogo = catalogoSet.has(cod);
       let esFragmento = false;
-      for (const s of skusLinea) {
-        if (s.indexOf(cod) !== -1) { esFragmento = true; break; }
+      if (!esSkuDeCatalogo) {
+        for (const s of skusPresentes) {
+          if (s !== cod && s.indexOf(cod) !== -1) { esFragmento = true; break; }
+        }
       }
       if (esFragmento) return;
 
