@@ -356,12 +356,12 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
       // Duplicado real contra una recepción VIVA (la RPC ya excluye anuladas
       // y ya intentó reanudar/idempotencia): mensaje limpio con folio/fecha.
       const m = rpcMsg.match(/\(folio ([^,]+), creada ([^,]+), \d+ linea/);
-      const distintas = /datos DISTINTOS/i.test(rpcMsg);
+      const distintas = /NO COINCIDEN/i.test(rpcMsg);
       const e = new Error(
         `Esta factura (FVTA_${nz(oc.ref_fvta) || "?"}) ya fue cargada antes` +
         (m ? ` — el ${m[2]}` + (m[1] ? ` (folio ${m[1]})` : "") : "") +
         (distintas
-          ? ", y con DATOS DISTINTOS a los de este envío (líneas o totales). Revisala en el WMS antes de reenviar."
+          ? ". Los datos registrados NO COINCIDEN con los de este envío (líneas o totales) — pudieron editarla en el WMS. Revisala antes de reenviar."
           : "; no se registra de nuevo.") +
         " Si es un error, avisá con el folio."
       );
@@ -1306,6 +1306,10 @@ function App() {
   // ---- Send to WMS ----
   const [wmsResult, setWmsResult] = useState(null);
   const sendToWMS = useCallback(async () => {
+    // Reset ANTES de los guards: cualquiera de los returns tempranos de abajo
+    // pinta un error nuevo, y una bandera de duplicado rancia lo disfrazaria
+    // de "🔁 Factura ya registrada" (hallazgo auditoria ronda 4).
+    setWmsErrorEsDup(false);
     if (!isWMSConfigured()) { setWmsError("WMS no configurado. Editar WMS_CONFIG en index.html"); setWmsStatus("error"); return; }
     // Cuadre: la suma de las líneas debe coincidir con el neto declarado en la factura.
     // Si OCR/Claude lee mal un precio, la diferencia se ve acá y bloqueamos el envío para
@@ -3072,9 +3076,14 @@ function App() {
                     <div style={{color: wmsErrorEsDup ? "#F59E0B" : "#EF4444", fontWeight: 700, fontSize: 12}}>
                       {wmsErrorEsDup ? "🔁 Factura ya registrada: " : "❌ Error: "}{wmsError}
                     </div>
-                    {!wmsErrorEsDup && (
-                      <button onClick={sendToWMS} style={{marginTop: 6, padding: "6px 14px", borderRadius: 6, background: "#222", color: "#EF4444", fontSize: 11, fontWeight: 600, border: "1px solid #333", cursor: "pointer"}}>Reintentar</button>
-                    )}
+                    {/* El boton se queda SIEMPRE: es el unico disparador de envio
+                        en este paso, y tras resolver un duplicado en el WMS
+                        (anular la equivocada) el paso final es justamente
+                        reenviar. Un reintento inutil es inofensivo: la RPC es
+                        idempotente y a lo sumo repite la excepcion. */}
+                    <button onClick={sendToWMS} style={{marginTop: 6, padding: "6px 14px", borderRadius: 6, background: "#222", color: wmsErrorEsDup ? "#F59E0B" : "#EF4444", fontSize: 11, fontWeight: 600, border: "1px solid #333", cursor: "pointer"}}>
+                      {wmsErrorEsDup ? "Reintentar (solo si ya la resolviste en el WMS)" : "Reintentar"}
+                    </button>
                   </div>
                 )}
               </div>
@@ -3129,7 +3138,7 @@ function App() {
                   );
                 })()}
                 {wmsStatus === "error" && (
-                  <div style={{marginTop: 4, color: "#EF4444", fontSize: 11, textAlign: "center"}}>{wmsError}</div>
+                  <div style={{marginTop: 4, color: wmsErrorEsDup ? "#F59E0B" : "#EF4444", fontSize: 11, textAlign: "center"}}>{wmsErrorEsDup ? "🔁 Factura ya registrada: " : ""}{wmsError}</div>
                 )}
               </div>
             )}
