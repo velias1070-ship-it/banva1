@@ -1131,7 +1131,10 @@ function App() {
   // useMemo sobre extractedProducts y ADEMAS se re-evalua dentro de
   // generateLabels/sendToWMS (cinturon y tirantes).
   const candados = React.useMemo(() => {
-    if (!window.BanvaLocks) return { bloqueos: [], sinLocks: true };
+    // Fallo CERRADO: si el modulo no cargo (red caida en la primera visita,
+    // deploy a medias), NO se finge que los candados pasaron — eso recrearia
+    // el agujero del incidente. El remedio es visible y trivial: recargar.
+    if (!window.BanvaLocks) return { bloqueos: [{ tipo: "locks_ausente", mensaje: "El módulo de candados de integridad no cargó. Recargá la página antes de imprimir o enviar." }] };
     try {
       return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw });
     } catch (e) {
@@ -1218,8 +1221,9 @@ function App() {
     // memo: cinturon y tirantes contra estado rancio). Un corrimiento conserva
     // la suma exacta, asi que el cuadre de arriba es ciego a esta clase de
     // error — estos candados son la unica defensa (incidente 546747).
-    if (window.BanvaLocks) {
+    {
       const cand = (() => {
+        if (!window.BanvaLocks) return { bloqueos: [{ mensaje: "El módulo de candados de integridad no cargó. Recargá la página." }] };
         try { return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw }); }
         catch (e) { return { bloqueos: [{ mensaje: "Los candados de integridad fallaron (" + (e.message || e) + ")." }] }; }
       })();
