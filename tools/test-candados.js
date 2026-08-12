@@ -450,6 +450,28 @@ console.log("CASO 13 — SKU corto omitido no se tapa con su variante pack:");
 }
 
 // ------------------------------------------------------------
+// CASO 14 — catalogo VACIO degrada CERRADO (hallazgo auditoria v2): si el
+// diccionario no cargo (red/RLS), el descarte de fragmentos NO corre — sin la
+// pertenencia exacta no se distingue fragmento de SKU corto real, y preferimos
+// la alarma re-escaneable a tapar una omision en silencio. El fragmento del
+// pliegue del 546747 debe volver a alarmar cuando no hay catalogo.
+// ------------------------------------------------------------
+console.log("CASO 14 — sin catalogo, el fragmento NO se descarta (falla cerrado):");
+{
+  const conFragmento = [
+    linea("TXW26PMVC15CR", "Plumon Vicenza 1,5 Pl Crema", 4, 14000, { nombreDict: "Plumon Vicenza 1,5 Pl Crema", matched: true }),
+  ];
+  const res = Locks.evaluarCandados({
+    productos: conFragmento,
+    ocrText: "TXW26PMVC15CR TXW26PMVC15CR\nXW26PMVC25TE XW26PMVC25TE",
+    skusCatalogo: [],
+  });
+  check("fragmento XW26PMVC25TE alarma cuando el catalogo no esta disponible",
+    res.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "XW26PMVC25TE"),
+    JSON.stringify(res.bloqueos.map(b => b.mensaje)));
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");

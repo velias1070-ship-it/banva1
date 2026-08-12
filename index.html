@@ -324,39 +324,51 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
   let ramaCreacion = null;
   let usoLegacy = false;
   {
-    let { data: rpcRes, error: rpcErr } = await sb.rpc("crear_recepcion_etiquetas", {
+    const { data: rpcRes, error: rpcErr } = await sb.rpc("crear_recepcion_etiquetas", {
       p_cabecera: cabecera,
       p_lineas: lineasPayload,
     });
-    // Entorno sin la columna factura_original: reintentar la RPC sin forense
-    // (misma degradación que ya tiene el camino legacy).
-    if (rpcErr && /factura_original/i.test(String(rpcErr.message || ""))) {
-      const sinForense = { ...cabecera };
-      delete sinForense.factura_original;
-      ({ data: rpcRes, error: rpcErr } = await sb.rpc("crear_recepcion_etiquetas", {
-        p_cabecera: sinForense,
-        p_lineas: lineasPayload,
-      }));
-    }
+    const rpcMsg = String(rpcErr?.message || "");
     if (!rpcErr && rpcRes && rpcRes.recepcion_id) {
       recId = rpcRes.recepcion_id;
       ramaCreacion = rpcRes.rama || "creada";
-    } else if (rpcErr && (rpcErr.code === "PGRST202" || /does not exist|Could not find the function/i.test(String(rpcErr.message || "")))) {
-      // RPC no desplegada aún: camino legacy (ventana de deploy).
+    } else if (rpcErr && (rpcErr.code === "PGRST202" || /Could not find the function/i.test(rpcMsg))) {
+      // RPC no desplegada aún: camino legacy (ventana de deploy). SOLO estas
+      // dos firmas significan "la función no existe" — cualquier otro error de
+      // la RPC se propaga (degradar callado perdería la atomicidad justo
+      // cuando algo está roto).
       usoLegacy = true;
       console.warn("[crear_recepcion] RPC atómica no disponible, usando camino legacy de dos pasos");
-    } else if (rpcErr && /ya tiene una recepcion activa/i.test(String(rpcErr.message || ""))) {
+    } else if (rpcErr && /factura_original/i.test(rpcMsg)) {
+      // Entorno sin la columna factura_original: el legacy sabe reintentar
+      // sin forense (reintentar la RPC sería inútil: referencia la columna
+      // en su propio SQL).
+      usoLegacy = true;
+      console.warn("[crear_recepcion] factura_original no existe en este entorno, usando camino legacy:", rpcMsg);
+    } else if (rpcErr && /ya tiene una recepcion activa/i.test(rpcMsg)) {
       // Duplicado real contra una recepción VIVA (la RPC ya excluye anuladas
-      // y ya intentó reanudar/idempotencia): mensaje con la info que trae.
+      // y ya intentó reanudar/idempotencia): mensaje limpio con folio/fecha.
+      const m = rpcMsg.match(/\(folio ([^,]+), creada ([^,]+), \d+ linea/);
+      const distintas = /lineas DISTINTAS/i.test(rpcMsg);
       const e = new Error(
-        `Esta factura (FVTA_${nz(oc.ref_fvta) || "?"}) ya fue cargada antes; no se registra de nuevo. ` +
-        String(rpcErr.message || "").replace(/^[^:]*: ?/, "") +
+        `Esta factura (FVTA_${nz(oc.ref_fvta) || "?"}) ya fue cargada antes` +
+        (m ? ` — el ${m[2]}` + (m[1] ? ` (folio ${m[1]})` : "") : "") +
+        (distintas
+          ? ", y con LÍNEAS DISTINTAS a las de este envío. Revisala en el WMS antes de reenviar."
+          : "; no se registra de nuevo.") +
         " Si es un error, avisá con el folio."
       );
       e.esDupFvta = true;
       throw e;
+    } else if (rpcErr && /lock timeout|55P03|deadlock/i.test(rpcMsg)) {
+      // Advisory lock por FVTA: otra pestaña está cargando ESTA factura.
+      throw new Error("Otra pestaña está cargando esta misma factura en este momento. Esperá unos segundos y apretá Reintentar.");
     } else if (rpcErr) {
       throw new Error("Error creando recepción: " + rpcErr.message);
+    } else {
+      // rpcErr vacío pero sin recepcion_id: NUNCA dejarlo pasar como éxito
+      // (el caller pondría el check verde sobre una recepción que no existe).
+      throw new Error("Error creando recepción: la RPC no devolvió recepcion_id (respuesta: " + JSON.stringify(rpcRes) + ")");
     }
   }
 
@@ -3019,7 +3031,12 @@ function App() {
                     )}
                     {wmsResult && wmsResult.rama === "ya_estaba" && (
                       <div style={{color: "#F59E0B", fontSize: 11, marginTop: 4}}>
-                        ↻ Esta factura ya estaba registrada completa: el reintento fue seguro, no se duplicó nada.
+                        ↻ Esta factura ya estaba cargada con estas mismas líneas; no se registró de nuevo.
+                      </div>
+                    )}
+                    {wmsResult && wmsResult.rama === "creada_legacy" && (
+                      <div style={{color: "#F59E0B", fontSize: 11, marginTop: 4}}>
+                        ⚠ Se creó por el camino viejo (la creación atómica no está desplegada en este entorno). Avisá si ves este mensaje.
                       </div>
                     )}
                     {wmsResult && wmsResult.proveedor && (

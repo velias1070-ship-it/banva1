@@ -247,8 +247,15 @@
     });
     const catalogo = (skusCatalogo || []).map(normSku).filter(Boolean);
     const catalogoSet = new Set(catalogo);
+    // Hash barato del CONTENIDO del catalogo: la decision de descartar un
+    // fragmento depende de la pertenencia exacta (catalogoSet.has), asi que un
+    // catalogo del mismo largo pero distinto contenido no puede reusar cache.
+    let catHash = 0;
+    for (const s of catalogo) {
+      for (let i = 0; i < s.length; i++) catHash = (catHash * 31 + s.charCodeAt(i)) | 0;
+    }
     const cacheKey = String(ocrText).length + "|" + String(ocrText).slice(0, 80) +
-      "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length;
+      "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length + "|" + catHash;
     if (cacheKey === _codCacheKey) return _codCacheVal;
 
     const candidatos = new Set();
@@ -271,7 +278,11 @@
       // ...X1, TXALMILLVIS46 ⊂ ...X2 — con historial real de recepcion): un
       // producto corto OMITIDO quedaria "cubierto" por el pack presente. El
       // fragmento real ("XW26PMVC") no existe en el catalogo — se distingue.
-      const esSkuDeCatalogo = catalogoSet.has(cod);
+      // Sin catalogo (diccionario caido / no cargado) el descarte NO corre:
+      // fallar CERRADO. Sin la pertenencia exacta no se puede distinguir un
+      // fragmento de pliegue de un SKU corto real, y preferimos el falso
+      // positivo (alarma re-escaneable) a tapar una omision en silencio.
+      const esSkuDeCatalogo = catalogoSet.size === 0 || catalogoSet.has(cod);
       let esFragmento = false;
       if (!esSkuDeCatalogo) {
         for (const s of skusPresentes) {
