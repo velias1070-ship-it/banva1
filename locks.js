@@ -33,21 +33,43 @@
 
   function tokens(s) { return normTexto(s).split(/\s+/).filter(Boolean); }
 
-  // Tokens que llevan digitos, con ceros a la izquierda normalizados ("050"→"50").
-  // Son los discriminantes de talla/medida ("15p", "20p", "45", "75", "144h").
-  // La comparacion difusa NO sirve aca: "Sherpa 20P Azul" vs "Sherpa 25P Azul"
-  // da 0.97 de similitud y es justo el corrimiento que hay que atrapar.
+  // Discriminantes numericos de talla/medida: las CORRIDAS de digitos de cada
+  // token, con ceros a la izquierda normalizados. Se separan de las letras
+  // ("x2"→["2"], "50x70"→["50","70"], "15p"→["15"]): medido contra el corpus
+  // real, comparar el token entero producia falsos positivos deterministas
+  // ("x2" impreso vs "x 2" en catalogo) que dejaban facturas sanas imposibles
+  // de enviar. La comparacion difusa tampoco sirve en el otro extremo:
+  // "Sherpa 20P Azul" vs "Sherpa 25P Azul" da 0.97 de similitud y es justo el
+  // corrimiento que hay que atrapar. Digitos exactos, letras ignoradas.
   function numTokens(s) {
-    return tokens(s)
-      .filter(function (t) { return /\d/.test(t); })
-      .map(function (t) { return t.replace(/^0+(?=\d)/, ""); })
-      .sort();
+    const out = [];
+    tokens(s).forEach(function (t) {
+      const runs = t.match(/\d+/g);
+      if (!runs) return;
+      runs.forEach(function (r) { out.push(r.replace(/^0+(?=\d)/, "")); });
+    });
+    return out.sort();
   }
 
-  function mismosNumTokens(a, b) {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  // Multiset a ⊆ b
+  function subMultiset(a, b) {
+    const resto = {};
+    b.forEach(function (t) { resto[t] = (resto[t] || 0) + 1; });
+    for (let i = 0; i < a.length; i++) {
+      if (!resto[a[i]]) return false;
+      resto[a[i]]--;
+    }
     return true;
+  }
+
+  // Alarma solo si NINGUN lado contiene al otro. El caso real que esto salva:
+  // la factura imprime la medida ("...plumas de ganso 50x70") y el catalogo la
+  // guarda en otra columna ("...plumas de ganso") — superconjunto legitimo, no
+  // corrimiento. Un corrimiento real cambia la talla (["15"] vs ["20"]): ahi
+  // ningun lado contiene al otro y dispara igual que antes (validado: las 19
+  // corridas malas del test de loteria siguen bloqueadas con esta regla).
+  function numTokensCompatibles(a, b) {
+    return subMultiset(a, b) || subMultiset(b, a);
   }
 
   function jaccard(aArr, bArr) {
@@ -97,6 +119,10 @@
     (productos || []).forEach(function (p, idx) {
       const sku = normSku(p.sku);
       if (!sku) return;
+      // Lineas con cantidad 0 son "pendientes de accion" (candado D las exige
+      // completar o eliminar): sumarlas aca solo duplicaba la alarma sobre la
+      // misma linea con un mensaje que ademas contradecia al de D.
+      if (!(Number(p.cantidad) > 0)) return;
       (porSku[sku] = porSku[sku] || []).push({ idx: idx, costo: Number(p.costo) || 0, cantidad: Number(p.cantidad) || 0 });
     });
     const out = [];
@@ -131,10 +157,11 @@
     const out = [];
     (productos || []).forEach(function (p, idx) {
       if (!p || !p.nombre || !p.nombreDict) return;
+      if (!(Number(p.cantidad) > 0)) return; // pendiente de accion: candado D la cubre
       const nf = numTokens(p.nombre);
       const nd = numTokens(p.nombreDict);
       if (nf.length === 0 || nd.length === 0) return;
-      if (!mismosNumTokens(nf, nd)) {
+      if (!numTokensCompatibles(nf, nd)) {
         out.push({
           tipo: "descripcion_no_calza",
           idx: idx,
@@ -159,6 +186,13 @@
     const arr = productos || [];
     arr.forEach(function (p, i) {
       if (!p || !p.nombre) return;
+      // Sin nombre de catalogo propio no hay linea base contra que comparar:
+      // un producto NUEVO (aun sin diccionario) al lado de un hermano del
+      // catalogo daria falso positivo estructural. Se calla; si la linea esta
+      // realmente corrida, los otros candados (duplicado/codigos/descripcion
+      // del vecino) la delatan.
+      if (!p.nombreDict) return;
+      if (!(Number(p.cantidad) > 0)) return; // pendiente de accion: candado D la cubre
       const propio = jaccard(tokens(p.nombre), tokens(p.nombreDict || ""));
       [i - 1, i + 1].forEach(function (j) {
         if (j < 0 || j >= arr.length) return;
@@ -191,8 +225,27 @@
   // alfanumericos (proveedor de libros, ISBN puro-digitos) no hay candidatos y
   // el candado se calla solo.
   // ------------------------------------------------------------
-  function checkCodigosFactura(ocrText, productos) {
+  // Cache: este chequeo es el unico caro (candidatos × skus × levenshtein) y el
+  // useMemo del frontend lo re-invoca con cada tecla (editar un costo cambia el
+  // array de productos pero no los SKUs). Clave = ocrText + skus de linea +
+  // tamano del catalogo; si no cambio, se devuelve el resultado anterior.
+  let _codCacheKey = null;
+  let _codCacheVal = null;
+
+  function checkCodigosFactura(ocrText, productos, skusCatalogo) {
     if (!ocrText) return [];
+    const skusLinea = [];
+    (productos || []).forEach(function (p) {
+      if (!p) return;
+      const s = normSku(p.sku); if (s) skusLinea.push(s);
+      const sv = normSku(p.skuVenta); if (sv) skusLinea.push(sv);
+      const so = normSku(p.skuOriginal); if (so) skusLinea.push(so);
+    });
+    const catalogo = (skusCatalogo || []).map(normSku).filter(Boolean);
+    const cacheKey = String(ocrText).length + "|" + String(ocrText).slice(0, 80) +
+      "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length;
+    if (cacheKey === _codCacheKey) return _codCacheVal;
+
     const candidatos = new Set();
     String(ocrText).toUpperCase().split(/[^A-Z0-9]+/).forEach(function (t) {
       if (t.length < 8 || t.length > 20) return;
@@ -202,18 +255,29 @@
       if (letras < 3 || digitos < 2) return;
       candidatos.add(t);
     });
-    const skusLinea = [];
-    (productos || []).forEach(function (p) {
-      if (!p) return;
-      const s = normSku(p.sku); if (s) skusLinea.push(s);
-      const sv = normSku(p.skuVenta); if (sv) skusLinea.push(sv);
-      const so = normSku(p.skuOriginal); if (so) skusLinea.push(so);
-    });
+
+    const enLinea = new Set(skusLinea);
     const out = [];
     candidatos.forEach(function (cod) {
-      let cubierto = false;
+      let minLinea = 3;
       for (const s of skusLinea) {
-        if (levenshtein(cod, s, 2) <= 2) { cubierto = true; break; }
+        const d = levenshtein(cod, s, 2);
+        if (d < minLinea) minLinea = d;
+        if (minLinea === 0) break;
+      }
+      let cubierto = minLinea <= 2;
+      // Arbitro de catalogo: en el catalogo real el 80% de los SKUs tiene un
+      // hermano a distancia ≤2 (misma familia, otra talla/color). Sin esto, si
+      // el OCR trae "TXW26PMVC25TE" y la linea solo tiene "TXW26PMVC25AZ", la
+      // tolerancia ≤2 lo daba por cubierto y la linea OMITIDA pasaba callada —
+      // exactamente la mitad mas cara del incidente 546747. Regla: si el token
+      // esta MAS CERCA de un SKU de catalogo que no tiene linea que de
+      // cualquier SKU de linea, ese token es un producto que falta.
+      if (cubierto && minLinea > 0 && catalogo.length > 0) {
+        for (const c of catalogo) {
+          if (enLinea.has(c)) continue;
+          if (levenshtein(cod, c, minLinea - 1) < minLinea) { cubierto = false; break; }
+        }
       }
       if (!cubierto) {
         out.push({
@@ -223,6 +287,8 @@
         });
       }
     });
+    _codCacheKey = cacheKey;
+    _codCacheVal = out;
     return out;
   }
 
@@ -257,9 +323,19 @@
   // mensajes listos para mostrar. Debe llamarse sobre el estado VIVO
   // (extractedProducts post-edicion) — nunca sobre un snapshot del escaneo.
   // ------------------------------------------------------------
+  // Dos clases de bloqueo con remedio DISTINTO:
+  // - "reescanear": corrimiento/duplicado/codigo faltante — arreglarlo a mano
+  //   solo esconde el error (asi entro el incidente); la salida es re-escanear.
+  // - "accion": lineas sin SKU o cantidad 0 — la salida ES manual (completar o
+  //   eliminar). Mezclar ambas bajo el cartel "no toques nada, re-escanea"
+  //   dejaba al operador re-escaneando en loop una linea que el papel no deja
+  //   leer.
+  const CLASE_ACCION = { linea_descartable: true };
+
   function evaluarCandados(input) {
     const productos = (input && input.productos) || [];
     const ocrText = (input && input.ocrText) || "";
+    const skusCatalogo = (input && input.skusCatalogo) || [];
     const bloqueos = [];
 
     checkDuplicados(productos).forEach(function (v) { bloqueos.push(v); });
@@ -271,10 +347,15 @@
       if (!idxE1.has(v.idx)) bloqueos.push(v); // una alarma por linea basta
     });
 
-    checkCodigosFactura(ocrText, productos).forEach(function (v) { bloqueos.push(v); });
+    checkCodigosFactura(ocrText, productos, skusCatalogo).forEach(function (v) { bloqueos.push(v); });
     checkDescartes(productos).forEach(function (v) { bloqueos.push(v); });
 
-    return { bloqueos: bloqueos };
+    bloqueos.forEach(function (b) { b.clase = CLASE_ACCION[b.tipo] ? "accion" : "reescanear"; });
+    return {
+      bloqueos: bloqueos,
+      reescanear: bloqueos.filter(function (b) { return b.clase === "reescanear"; }),
+      accion: bloqueos.filter(function (b) { return b.clase === "accion"; }),
+    };
   }
 
   return {

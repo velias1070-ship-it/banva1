@@ -214,6 +214,189 @@ console.log("CASO 7 — tolerancia del diff de codigos (sanas, deben PASAR):");
 }
 
 // ------------------------------------------------------------
+// CASO 8 — Falsos positivos DETERMINISTAS medidos en el corpus (544565 y
+// 545703): el token entero "x2" vs "x 2" del catalogo, y la factura que
+// imprime la medida ("50x70") cuando el catalogo la guarda en otra columna.
+// Con la comparacion por corridas de digitos + subconjunto deben PASAR.
+// ------------------------------------------------------------
+console.log("CASO 8 — tokenizacion x2 / 50x70 (FPs reales, deben PASAR):");
+{
+  const productos = [
+    linea("TX2PKALMPRIBV", "Pack almohadas BANVA x2", 150, 6900, { nombreDict: "Pack almohadas BANVA x 2", matched: true }),
+    linea("TX2ALMPL15507", "Pack Almohada Illusions 15% plumas de ganso 50x70", 12, 10000, { nombreDict: "Pack Almohada Illusions 15% plumas de ganso", matched: true }),
+  ];
+  const res = Locks.evaluarCandados({ productos, ocrText: "" });
+  check("0 bloqueos", res.bloqueos.length === 0, JSON.stringify(res.bloqueos.map(b => b.mensaje)));
+  // Y el caso que SI es corrimiento (talla distinta) sigue disparando:
+  const res2 = Locks.evaluarCandados({ productos: [
+    linea("TXW26PMVC15CR", "Plumon VL Corduroy Sherpa 20P Azul", 8, 16000),
+  ], ocrText: "" });
+  check("talla distinta sigue disparando", res2.bloqueos.some(b => b.tipo === "descripcion_no_calza"));
+}
+
+// ------------------------------------------------------------
+// CASO 9 — Arbitro de catalogo en el diff de codigos: el 80% de los SKUs del
+// catalogo tiene un hermano a distancia ≤2. Si la factura trae el token del
+// hermano (25TE) y la linea solo tiene 25AZ, ANTES se daba por cubierto y la
+// linea omitida pasaba callada. Con el catalogo como arbitro debe disparar.
+// El token danado por pliegue (dist 1 de SU linea) debe seguir cubierto.
+// ------------------------------------------------------------
+console.log("CASO 9 — hermano omitido vs token danado (con catalogo):");
+{
+  const catalogo = Object.keys(DICT);
+  const soloAzul = [linea("TXW26PMVC25AZ", "Plumon VL Corduroy Sherpa 25P Azul", 8, 18000)];
+  const resOmitido = Locks.evaluarCandados({
+    productos: soloAzul,
+    ocrText: "XW26PMVC25AZ TXW26PMVC25AZ\nXW26PMVC25TE TXW26PMVC25TE",
+    skusCatalogo: catalogo,
+  });
+  check("hermano omitido (25TE en OCR, sin linea) dispara",
+    resOmitido.bloqueos.some(b => b.tipo === "codigo_sin_linea" && b.codigo === "TXW26PMVC25TE"));
+  const resDanado = Locks.evaluarCandados({
+    productos: [linea("TXV25QLBRVD20", "Quilt Breda 20P Verde", 8, 8000)],
+    ocrText: "TXV25QLBRD20\nTXV25QLBRVD20",
+    skusCatalogo: catalogo.concat(["TXV25QLBRVD15"]),
+  });
+  check("token danado (dist 1 de su linea) sigue cubierto", resDanado.bloqueos.length === 0,
+    JSON.stringify(resDanado.bloqueos.map(b => b.mensaje)));
+}
+
+// ------------------------------------------------------------
+// CASO 10 — Una linea con cantidad 0 genera SOLO linea_descartable (clase
+// accion), sin el duplicado_costo redundante que la contradecia (corrida #10
+// del test de loteria: mismo SKU con 8@8000 y 0@0).
+// ------------------------------------------------------------
+console.log("CASO 10 — cantidad 0: una sola alarma, clase accion:");
+{
+  const productos = [
+    linea("TXV25QLBRVD20", "Quilt Breda 20P Verde", 8, 8000),
+    linea("TXV25QLBRVD20", "Quilt Breda 20P Verde (ilegible)", 0, 0),
+  ];
+  const res = Locks.evaluarCandados({ productos, ocrText: "" });
+  check("solo linea_descartable", tipos(res).join(",") === "linea_descartable", JSON.stringify(tipos(res)));
+  check("clase accion (no re-escanear)", res.accion.length === 1 && res.reescanear.length === 0);
+}
+
+// ------------------------------------------------------------
+// CASO 11 — El OCR COMPLETO real de la 546747 (encabezado con RUTs, direccion,
+// O.Compra OVT_/FVTA_, pie con timbre SII y www) no genera candidatos falsos
+// en el diff de codigos cuando las lineas estan correctas.
+// ------------------------------------------------------------
+console.log("CASO 11 — OCR completo real: encabezado/pie sin falsos candidatos:");
+{
+  const OCR_COMPLETO = `idetex..
+IDETEX S.A.
+VENTA DE PRODUCTOS TEXTILES Y OTROS PARA
+EL HOGAR
+CASA MATRIZ: JUAN DE LA FUENTE 353, BODEGA F, LAMPA
+SANTIAGO
+Fecha de Emisión :11 de Agosto de 2026
+Razón Social: BANVA SPA
+Dirección: Los militares 5934 Las Condes Santiago CHILE
+Giro: Venta al por menor por internet
+Fono:
+Vendedor: IDETEX
+R.U.T.: 76.676.820-2
+FACTURA ELECTRÓNICA
+O.Compra: OVT_00482920/FVTA_00436068
+Transporte:
+N° 546747
+S.I.I. SANTIAGO PONIENTE
+R.U.T: 77.994.007-1
+Ciudad: Santiago
+Comuna: Las Condes
+Docs. Previos:
+Cond.Pago: 60
+F.1er.Venc: 10/10/2026
+POR LO SIGUIENTE:
+Cod.Alter.
+TXV24QLBRCN25 TXV24QLBRCN25
+TXV24QLBRMA15 TXV24QLBRMA15
+TXV25QLBRGR15 TXV25QLBRGR15
+TXV25QLBRD20
+TXV25QLBRVD20
+XW26PMVC5CR TXW26PMVC15CR
+XW26PMVC20AZ TXW26PMVC20AZ
+XW26PMVC25AZ TXW26PMVC25AZ
+XW26PMVC25TE TXW26PMVC25TE
+TXW26QLVD20AZ TXW26QLVD20AZ
+DEBE
+A: Idetex
+Código
+Unid.
+Descripción del Producto
+Precio U.
+Descto.
+Valor Total
+8
+Quilt Bruselas Canela 25P
+9.100
+72.800
+8
+Quilt Bruselas Marron 15P
+7.000
+56.000
+8
+7.000
+56.000
+Quilt Breda 15P Gris
+8
+8.000
+64.000
+Quilt Breda 20P Verde
+4
+Plumon VL Corduroy Sherpa 15P Crema
+14.000
+56.000
+8
+Plumon VL Corduroy Sherpa 20P Azul
+16.000
+128.000
+8
+Plumon VL Corduroy Sherpa 25P Azul
+18.000
+144.000
+8
+4
+Plumon VL Corduroy Sherpa 25P Terracota
+Quilt Sherpa VL Dobby 20P Azul
+18.000
+144.000
+15.000
+60.000
+Total Unidades: 64
+SON: Novecientos Veintinueve Mil Ciento Cincuenta y Dos Pesos
+NETO $
+780.800
+Exento $
+0
+19% I.V.A.
+148.352
+TOTAL $
+929.152
+DOCUMENTO(S) DE REFERENCIA
+Orden de Compra N° 048/11-AGO-2026
+Timbre Electrónico SII
+Res. 80 del 2014
+Verifique documento: www.sil.cl
+Solución de Factura Electrónica de: www.acepta.com`;
+  const productosOk = [
+    linea("TXV24QLBRCN25", "Quilt Bruselas Canela 25P", 8, 9100),
+    linea("TXV24QLBRMA15", "Quilt Bruselas Marron 15P", 8, 7000),
+    linea("TXV25QLBRGR15", "Quilt Breda 15P Gris", 8, 7000),
+    linea("TXV25QLBRVD20", "Quilt Breda 20P Verde", 8, 8000),
+    linea("TXW26PMVC15CR", "Plumon VL Corduroy Sherpa 15P Crema", 4, 14000),
+    linea("TXW26PMVC20AZ", "Plumon VL Corduroy Sherpa 20P Azul", 8, 16000),
+    linea("TXW26PMVC25AZ", "Plumon VL Corduroy Sherpa 25P Azul", 8, 18000),
+    linea("TXW26PMVC25TE", "Plumon VL Corduroy Sherpa 25P Terracota", 8, 18000),
+    linea("TXW26QLVD20AZ", "Quilt Sherpa VL Dobby 20P Azul", 4, 15000),
+  ];
+  const res = Locks.evaluarCandados({ productos: productosOk, ocrText: OCR_COMPLETO, skusCatalogo: Object.keys(DICT) });
+  check("extraccion correcta + OCR completo = 0 bloqueos", res.bloqueos.length === 0,
+    JSON.stringify(res.bloqueos.map(b => b.mensaje)));
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");

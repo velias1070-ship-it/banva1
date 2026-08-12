@@ -2,7 +2,12 @@ const CACHE_NAME = 'banva-etiquetas-v3';
 const ASSETS = ['/', '/index.html', '/locks.js', '/manifest.json'];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(ASSETS)));
+  // addAll es atomico: un solo asset caido (deploy a medias) rechazaria el
+  // install completo y el navegador se quedaria en la version vieja del cache.
+  // Precache best-effort por asset; el fetch handler es network-first igual.
+  e.waitUntil(caches.open(CACHE_NAME).then(c =>
+    Promise.allSettled(ASSETS.map(a => c.add(a)))
+  ));
   self.skipWaiting();
 });
 

@@ -249,7 +249,7 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
   const proveedorFinal = nombre_canonico || proveedor || "Desconocido";
 
   // 2. Create recepcion
-  const { data: rec, error: recErr } = await sb.from("recepciones").insert({
+  const cabecera = {
     folio: folio || "SIN_FOLIO",
     proveedor: proveedorFinal,
     proveedor_id: proveedor_id,
@@ -278,11 +278,25 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
         nombre_factura: p.nombre || "", nombre_dict: p.nombreDict || "",
         cantidad: p.cantidad || 0, costo: p.costo || 0, codigo_ml: p.codigoML || "",
       })),
-      descartadas: (productos || []).filter(p => !(p.sku && p.cantidad > 0)).map(p => ({
-        sku: p.sku || "", nombre_factura: p.nombre || "", cantidad: p.cantidad || 0, costo: p.costo || 0,
-      })),
+      // Lineas que el operador borro con ✕ en la revision — lo unico que antes
+      // desaparecia sin rastro. (Las lineas sin SKU/cantidad ya no llegan aca:
+      // el candado linea_descartable exige resolverlas antes de enviar.)
+      eliminadas_operador: forense.eliminadas || [],
+      // Si el envio salio con override de candados, queda el motivo y que
+      // bloqueos se saltaron: el incidente no puede repetirse EN SILENCIO.
+      override: forense.override || null,
     } : null,
-  }).select("id").single();
+  };
+
+  let { data: rec, error: recErr } = await sb.from("recepciones").insert(cabecera).select("id").single();
+  // En entornos donde la columna factura_original no exista (branch/staging
+  // viejo), PostgREST aborta el insert COMPLETO (PGRST204). El forense es
+  // deseable; poder recibir mercaderia es obligatorio: reintenta sin el campo.
+  if (recErr && (recErr.code === "PGRST204" || /factura_original/i.test(String(recErr.message || "")))) {
+    console.warn("factura_original no existe en este entorno; reintentando sin forense:", recErr.message);
+    delete cabecera.factura_original;
+    ({ data: rec, error: recErr } = await sb.from("recepciones").insert(cabecera).select("id").single());
+  }
 
   if (recErr) {
     // Doble carga de la MISMA factura: ref_fvta tiene UNIQUE parcial → 23505
@@ -613,6 +627,14 @@ function App() {
   // por eso el incidente 546747 solo pudo reconstruirse re-corriendo el OCR.
   const [ocrTextRaw, setOcrTextRaw] = useState("");
   const [parsedCrudo, setParsedCrudo] = useState(null);
+  // Valvula de escape trazable: un falso positivo de los candados NO puede
+  // dejar la bodega parada para siempre. El override exige motivo escrito y
+  // queda guardado en factura_original — el incidente sigue siendo imposible
+  // de repetir EN SILENCIO, y cada uso del override queda medido.
+  const [candadosOverride, setCandadosOverride] = useState(null); // {motivo, ts, tipos}
+  // Lineas que el operador ELIMINO con ✕ durante la revision: es la unica
+  // informacion que hoy se pierde sin rastro; va al forense.
+  const eliminadasRef = useRef([]);
   // ---- Vínculo con Orden de Compra (OC) ----
   // Datos crudos leídos por OCR (Task 1 de api/process.js). Van SIEMPRE al INSERT
   // como auditoría, se vincule o no una OC. ref_fvta además tiene UNIQUE parcial:
@@ -1020,6 +1042,8 @@ function App() {
       // ocrText; el frontend lo botaba.
       setOcrTextRaw(data.ocrText || "");
       setParsedCrudo(parsed || null);
+      // Factura nueva = override y eliminadas de la anterior no aplican.
+      setCandadosOverride(null); eliminadasRef.current = [];
 
       // Debug: log raw entities to browser console
       if (data.debugEntities) {
@@ -1114,7 +1138,9 @@ function App() {
       // Distinguir "la foto salio mala" (el operador lo resuelve re-escaneando)
       // de "el motor esta caido" (key/creditos/API: re-escanear NO lo arregla y
       // el operador perdia tiempo intentando). El segundo caso pide avisar.
-      const esFallaDeSistema = /no configurada|api key|api error|401|402|429|credit|cupo|conectar|fetch failed|se cort/i.test(err.message || "");
+      // Frases especificas, no numeros sueltos: "429" a secas matcheaba montos
+      // y folios, y "se corto" es un timeout de foto grande (SI es de la foto).
+      const esFallaDeSistema = /no configurada|api key|API error: (401|402|403|429|5\d\d)|credit|cupo|no se pudo conectar|fetch failed|GOOGLE_VISION|EtiquetasBanva|autenticaci/i.test(err.message || "");
       setError(esFallaDeSistema
         ? "🔧 Esto NO es problema de la foto — avisale a Vicente tal cual:\n" + err.message
         : err.message);
@@ -1130,18 +1156,28 @@ function App() {
   // "Sin ML". Un snapshot tomado al escanear jamas lo habria visto. Por eso es
   // useMemo sobre extractedProducts y ADEMAS se re-evalua dentro de
   // generateLabels/sendToWMS (cinturon y tirantes).
+  const skusCatalogo = React.useMemo(() => dictionary.map(d => d.sku), [dictionary]);
   const candados = React.useMemo(() => {
+    const soloReescaneo = (bloqueo) => {
+      const b = { ...bloqueo, clase: "reescanear" };
+      return { bloqueos: [b], reescanear: [b], accion: [] };
+    };
     // Fallo CERRADO: si el modulo no cargo (red caida en la primera visita,
     // deploy a medias), NO se finge que los candados pasaron — eso recrearia
     // el agujero del incidente. El remedio es visible y trivial: recargar.
-    if (!window.BanvaLocks) return { bloqueos: [{ tipo: "locks_ausente", mensaje: "El módulo de candados de integridad no cargó. Recargá la página antes de imprimir o enviar." }] };
+    if (!window.BanvaLocks) return soloReescaneo({ tipo: "locks_ausente", mensaje: "El módulo de candados de integridad no cargó. Recargá la página antes de imprimir o enviar." });
     try {
-      return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw });
+      return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw, skusCatalogo });
     } catch (e) {
       // Si el modulo revienta, no se finge que todo esta bien: se avisa.
-      return { bloqueos: [{ tipo: "locks_error", mensaje: "Los candados de integridad fallaron (" + (e.message || e) + "). Avisale a Vicente antes de enviar." }] };
+      return soloReescaneo({ tipo: "locks_error", mensaje: "Los candados de integridad fallaron (" + (e.message || e) + "). Avisale a Vicente antes de enviar." });
     }
-  }, [extractedProducts, ocrTextRaw]);
+  }, [extractedProducts, ocrTextRaw, skusCatalogo]);
+  // Override valido solo mientras los bloqueos sean los MISMOS que el operador
+  // acepto: si despues de darlo cambia el estado y aparecen bloqueos nuevos,
+  // el override caduca solo.
+  const overrideActivo = !!(candadosOverride && candadosOverride.motivo &&
+    (candados.reescanear || []).every(b => candadosOverride.tipos.includes(b.tipo)));
 
   // ---- Generate Labels ----
   const generateLabels = useCallback(async () => {
@@ -1151,9 +1187,17 @@ function App() {
     // En el incidente 546747 las 4 etiquetas fantasma se imprimieron ANTES de
     // que nadie pudiera notar nada: la impresion corre antes que el envio y no
     // tenia ningun candado. Mismos bloqueos que el envio, aca tambien.
-    if (candados.bloqueos.length > 0) {
+    // Dos clases con remedio distinto: "accion" (completar/eliminar la linea,
+    // sin override posible) y "reescanear" (override trazable con motivo).
+    if ((candados.accion || []).length > 0) {
+      setError("Hay líneas incompletas que hay que resolver antes de imprimir:\n• " +
+        candados.accion.map(b => b.mensaje).join("\n• "));
+      setProcessing(false);
+      return;
+    }
+    if ((candados.reescanear || []).length > 0 && !overrideActivo) {
       setError("La lectura de esta factura tiene problemas — re-escaneala (estira el papel, evita sombras) antes de imprimir:\n• " +
-        candados.bloqueos.map(b => b.mensaje).join("\n• "));
+        candados.reescanear.map(b => b.mensaje).join("\n• "));
       setProcessing(false);
       return;
     }
@@ -1173,7 +1217,7 @@ function App() {
     setLabelPages(pages);
     setStep("labels");
     setProcessing(false);
-  }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators, candados]);
+  }, [extractedProducts, folioFactura, showCatSeparators, showProdSeparators, candados, overrideActivo]);
 
   // ---- Send to WMS ----
   const [wmsResult, setWmsResult] = useState(null);
@@ -1223,13 +1267,21 @@ function App() {
     // error — estos candados son la unica defensa (incidente 546747).
     {
       const cand = (() => {
-        if (!window.BanvaLocks) return { bloqueos: [{ mensaje: "El módulo de candados de integridad no cargó. Recargá la página." }] };
-        try { return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw }); }
-        catch (e) { return { bloqueos: [{ mensaje: "Los candados de integridad fallaron (" + (e.message || e) + ")." }] }; }
+        if (!window.BanvaLocks) return { reescanear: [{ tipo: "locks_ausente", mensaje: "El módulo de candados de integridad no cargó. Recargá la página." }], accion: [] };
+        try { return window.BanvaLocks.evaluarCandados({ productos: extractedProducts, ocrText: ocrTextRaw, skusCatalogo }); }
+        catch (e) { return { reescanear: [{ tipo: "locks_error", mensaje: "Los candados de integridad fallaron (" + (e.message || e) + ")." }], accion: [] }; }
       })();
-      if (cand.bloqueos.length > 0) {
+      if ((cand.accion || []).length > 0) {
+        setWmsError("Hay líneas incompletas — completálas o eliminálas con ✕ antes de enviar:\n• " +
+          cand.accion.map(b => b.mensaje).join("\n• "));
+        setWmsStatus("error");
+        return;
+      }
+      const overrideVigente = !!(candadosOverride && candadosOverride.motivo &&
+        (cand.reescanear || []).every(b => candadosOverride.tipos.includes(b.tipo)));
+      if ((cand.reescanear || []).length > 0 && !overrideVigente) {
         setWmsError("Lectura inconsistente — RE-ESCANEÁ la factura (estirá el papel, evitá sombras). No corrijas estas líneas a mano:\n• " +
-          cand.bloqueos.map(b => b.mensaje).join("\n• "));
+          cand.reescanear.map(b => b.mensaje).join("\n• "));
         setWmsStatus("error");
         return;
       }
@@ -1272,15 +1324,22 @@ function App() {
           ? ((refOcOcr ? "OC-" + refOcOcr + " · " : "") + ocValidResult.resultado)
           : null,
       };
-      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos, null, ocLink,
-        { ocrText: ocrTextRaw, parsedCrudo: parsedCrudo });
+      // Forense SOLO en el flujo con factura: en RAPIDO/LISTA no hay OCR y
+      // pasar el de una factura anterior escribia evidencia envenenada.
+      const forense = conFactura ? {
+        ocrText: ocrTextRaw,
+        parsedCrudo: parsedCrudo,
+        eliminadas: eliminadasRef.current,
+        override: candadosOverride,
+      } : null;
+      const result = await sendRecepcionToWMS(folioFactura, proveedorFactura, invoiceImage, extractedProducts, costos, null, ocLink, forense);
       setWmsResult(result);
       setWmsStatus("sent");
     } catch (err) {
       setWmsError(err.message);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo, skusCatalogo, candadosOverride]);
 
   // ---- Último costo conocido por SKU (de la última recepción) ----
   // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
@@ -1708,7 +1767,17 @@ function App() {
   };
 
   const removeProduct = (idx) => {
-    setExtractedProducts(prev => prev.filter((_, i) => i !== idx));
+    setExtractedProducts(prev => {
+      // Rastro forense: lo que el operador borra con ✕ era lo unico que
+      // desaparecia sin registro. Va a factura_original.eliminadas_operador.
+      const p = prev[idx];
+      if (p && (p.sku || p.nombre)) {
+        eliminadasRef.current = [...eliminadasRef.current, {
+          sku: p.sku || "", nombre_factura: p.nombre || "", cantidad: p.cantidad || 0, costo: p.costo || 0,
+        }];
+      }
+      return prev.filter((_, i) => i !== idx);
+    });
   };
 
   const addProduct = () => {
@@ -1774,7 +1843,12 @@ function App() {
     setRefOcOcr(""); setRefOvt(""); setRefFvta("");
     setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
     setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
-    
+    // Y el OCR crudo TAMBIEN: si quedaba el de la factura anterior, el candado
+    // de codigos corria esos codigos contra los productos del RAPIDO (22
+    // bloqueos falsos medidos) y el forense guardaba evidencia envenenada.
+    setOcrTextRaw(""); setParsedCrudo(null);
+    setCandadosOverride(null); eliminadasRef.current = [];
+
     const pages = await generateLabelsPDF(products, "RAPIDO");
     const filtered = pages.filter(p => 
       (p.type !== "separator-category" || showCatSeparators) && 
@@ -1853,7 +1927,10 @@ function App() {
     setRefOcOcr(""); setRefOvt(""); setRefFvta("");
     setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
     setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
-    
+    // OCR crudo tambien (misma razon que en RAPIDO: candados y forense de otra factura).
+    setOcrTextRaw(""); setParsedCrudo(null);
+    setCandadosOverride(null); eliminadasRef.current = [];
+
     let pages = await generateLabelsPDF(valid, "LISTA");
     if (!showCatSeparators) pages = pages.filter(p => p.type !== "separator-category");
     if (!showProdSeparators) pages = pages.filter(p => p.type !== "separator-product");
@@ -1885,7 +1962,13 @@ function App() {
         cantPack: dictItem.cantPack || 1,
         isPack: dictItem.isPack || false,
         matched: true,
-        matchType: "manual"
+        matchType: "manual",
+        // Conservar el SKU que venia del OCR (updateProduct ya lo hace; aca
+        // faltaba): sin esto, un token muy danado quedaba huerfano y el candado
+        // de codigos bloqueaba sin salida un arreglo manual LEGITIMO.
+        skuOriginal: (next[idx].sku && String(next[idx].sku).toUpperCase().trim() !== String(dictItem.sku).toUpperCase().trim())
+          ? String(next[idx].sku).toUpperCase().trim()
+          : (next[idx].skuOriginal || ""),
       };
       return next;
     });
@@ -2587,21 +2670,49 @@ function App() {
             )}
 
             {/* Candados de integridad: la lectura vino corrida/incompleta.
-                Bloquea impresión Y envío. La instrucción es re-escanear, no
-                "arreglar a mano": el incidente 546747 entró exactamente así —
-                el operador reparó la línea que la app le marcó y fabricó un
-                duplicado perfecto. */}
-            {candados.bloqueos.length > 0 && (
+                Bloquea impresión Y envío. Dos clases con remedio DISTINTO:
+                re-escanear (no arreglar a mano — así entró el incidente 546747:
+                el operador reparó la línea marcada y fabricó un duplicado
+                perfecto) vs acción (completar/eliminar la línea, que es
+                justamente manual). */}
+            {(candados.reescanear || []).length > 0 && (
               <div style={{...styles.warningCard, border: "1px solid rgba(239,68,68,0.5)", background: "rgba(239,68,68,0.08)"}}>
                 <div style={{fontSize: 24}}>🛑</div>
                 <div>
-                  <strong style={{color: "#EF4444"}}>La lectura de esta factura tiene {candados.bloqueos.length} problema(s) — re-escaneala</strong>
+                  <strong style={{color: "#EF4444"}}>La lectura de esta factura tiene {candados.reescanear.length} problema(s) — re-escaneala</strong>
                   <ul style={{margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#FCA5A5"}}>
-                    {candados.bloqueos.map((b, i) => <li key={i} style={{marginBottom: 4}}>{b.mensaje}</li>)}
+                    {candados.reescanear.map((b, i) => <li key={i} style={{marginBottom: 4}}>{b.mensaje}</li>)}
                   </ul>
                   <p style={{margin: "6px 0 0", fontSize: 12, color: "#F87171", fontWeight: 600}}>
                     Estirá el papel, evitá sombras y sacá la foto de nuevo. NO corrijas estas líneas a mano: si la lectura vino corrida, "arreglarla" solo esconde el error.
                   </p>
+                  {overrideActivo ? (
+                    <p style={{margin: "8px 0 0", fontSize: 12, color: "#F59E0B", fontWeight: 600}}>
+                      ⚠️ Override activo — se enviará igual. Motivo registrado: “{candadosOverride.motivo}”
+                      <span style={{color: "#3B82F6", cursor: "pointer", marginLeft: 8}} onClick={() => setCandadosOverride(null)}>cancelar override</span>
+                    </p>
+                  ) : (
+                    <p style={{margin: "8px 0 0", fontSize: 11, color: "#666"}}>
+                      ¿Estás seguro de que es una falsa alarma (el papel realmente dice esto)?{" "}
+                      <span style={{color: "#3B82F6", cursor: "pointer", textDecoration: "underline"}} onClick={() => {
+                        const motivo = window.prompt("Vas a imprimir/enviar una recepción que los candados marcan como lectura inconsistente.\n\nEscribí el MOTIVO (queda registrado junto a la recepción, mínimo 10 caracteres):");
+                        if (motivo === null) return;
+                        if (motivo.trim().length < 10) { alert("Motivo demasiado corto — no se activó el override."); return; }
+                        setCandadosOverride({ motivo: motivo.trim(), ts: new Date().toISOString(), tipos: [...new Set(candados.reescanear.map(b => b.tipo))] });
+                      }}>Enviar igual con motivo registrado</span>
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+            {(candados.accion || []).length > 0 && (
+              <div style={styles.warningCard}>
+                <div style={{fontSize: 24}}>✋</div>
+                <div>
+                  <strong>{candados.accion.length} línea(s) por resolver antes de imprimir/enviar</strong>
+                  <ul style={{margin: "6px 0 0", paddingLeft: 18, fontSize: 13, color: "#F59E0B"}}>
+                    {candados.accion.map((b, i) => <li key={i} style={{marginBottom: 4}}>{b.mensaje}</li>)}
+                  </ul>
                 </div>
               </div>
             )}
@@ -2775,15 +2886,24 @@ function App() {
 
             <div style={{display: "flex", gap: 10, marginTop: 10}}>
               <button style={styles.secondaryBtn} onClick={() => setStep("upload")}>← Volver</button>
-              <button
-                style={{...styles.primaryBtn, flex: 1, ...(candados.bloqueos.length > 0 ? {background: "#1a1a1a", color: "#666", border: "1px solid #333", cursor: "not-allowed"} : {})}}
-                onClick={generateLabels}
-                disabled={processing || candados.bloqueos.length > 0}
-              >
-                {candados.bloqueos.length > 0
-                  ? "🚫 Re-escaneá la factura antes de imprimir (" + candados.bloqueos.length + " problema(s) de lectura)"
-                  : "🏷️ Generar Etiquetas (" + extractedProducts.filter(p => p.codigoML).reduce((s, p) => s + p.cantidad, 0) + " etiquetas)"}
-              </button>
+              {(() => {
+                const nAccion = (candados.accion || []).length;
+                const nRe = (candados.reescanear || []).length;
+                const labelsBloqueado = nAccion > 0 || (nRe > 0 && !overrideActivo);
+                return (
+                  <button
+                    style={{...styles.primaryBtn, flex: 1, ...(labelsBloqueado ? {background: "#1a1a1a", color: "#666", border: "1px solid #333", cursor: "not-allowed"} : {})}}
+                    onClick={generateLabels}
+                    disabled={processing || labelsBloqueado}
+                  >
+                    {nAccion > 0
+                      ? "✋ Resolvé las líneas marcadas antes de imprimir (" + nAccion + ")"
+                      : (nRe > 0 && !overrideActivo)
+                        ? "🚫 Re-escaneá la factura antes de imprimir (" + nRe + " problema(s) de lectura)"
+                        : "🏷️ Generar Etiquetas (" + extractedProducts.filter(p => p.codigoML).reduce((s, p) => s + p.cantidad, 0) + " etiquetas)"}
+                  </button>
+                );
+              })()}
             </div>
 
             {/* WMS Integration */}
@@ -2799,7 +2919,9 @@ function App() {
                   // obligatorio (es lo único que detecta productos faltantes).
                   const esFlujoManual = folioFactura === "RAPIDO" || folioFactura === "LISTA";
                   const netoFaltante = !!invoiceImage && !esFlujoManual && netoCab <= 0;
-                  const conCandados = candados.bloqueos.length > 0;
+                  const candAccion = (candados.accion || []).length;
+                  const candRe = (candados.reescanear || []).length;
+                  const conCandados = candAccion > 0 || (candRe > 0 && !overrideActivo);
                   const blocked = sinCostos || desfase || netoFaltante || conCandados;
                   const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
                   return (
@@ -2813,7 +2935,7 @@ function App() {
                         disabled={blocked}
                         style={{width: "100%", padding: "12px 16px", borderRadius: 10, background: blocked ? "#1a1a1a" : "linear-gradient(135deg, #10b981, #059669)", color: blocked ? "#666" : "#fff", fontSize: 14, fontWeight: 700, border: blocked ? "1px solid #333" : "none", cursor: blocked ? "not-allowed" : "pointer", opacity: blocked ? 0.7 : 1}}
                       >
-                        {conCandados ? "🚫 Re-escaneá la factura (" + candados.bloqueos.length + " problema(s) de lectura — tarjeta roja de arriba)" : netoFaltante ? "🚫 Escribí el neto de la factura (tarjeta amarilla de arriba)" : sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : "📦 Enviar recepción al WMS"}
+                        {candAccion > 0 ? "✋ Resolvé las líneas marcadas (" + candAccion + " — tarjeta de arriba)" : conCandados ? "🚫 Re-escaneá la factura (" + candRe + " problema(s) de lectura — tarjeta roja de arriba)" : netoFaltante ? "🚫 Escribí el neto de la factura (tarjeta amarilla de arriba)" : sinCostos ? "🚫 Cargá el costo neto de cada producto" : desfase ? "🚫 Resolvé el desfase de costos antes de enviar" : (overrideActivo && candRe > 0 ? "📦 Enviar al WMS (override activo, quedará registrado)" : "📦 Enviar recepción al WMS")}
                       </button>
                     </>
                   );
@@ -2943,6 +3065,8 @@ function App() {
                 setQuickSearch("");
                 setPasteText("");
                 setShowPasteMode(false);
+                setOcrTextRaw(""); setParsedCrudo(null);
+                setCandadosOverride(null); eliminadasRef.current = [];
               }}>
                 📄 Nueva Factura
               </button>
