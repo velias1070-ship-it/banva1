@@ -1,0 +1,25 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+# Conductor — banva1 (factura → etiquetas): estático + api/process.js como Vercel Function.
+# Se corre con 'vercel dev' (necesita el link .vercel/ del checkout principal ~/banva1).
+# OJO: push a main auto-deploya PROD (proyecto Vercel 'banva1'); siempre PR.
+
+file_include_globs = """
+.vercel/**
+"""
+
+[scripts]
+run = """
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+vercel dev --listen "$CONDUCTOR_PORT" --yes
+"""
+run_mode = "concurrent"
+
+[git]
+# Convención del workflow: rama corta -> PR a main -> merge -> borrar rama.
+archive_on_merge = true
+delete_branch_on_archive = true
+
+[[preview_urls]]
+name = "app"
+url = "http://localhost:$CONDUCTOR_PORT"
