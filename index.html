@@ -2752,7 +2752,10 @@ function App() {
                 <div>
                   <strong>{unmatchedProducts.length} producto(s) sin Código ML</strong>
                   <p style={{margin: "4px 0 0", fontSize: 13, color: "#F59E0B"}}>
-                    Usa el buscador en cada producto para encontrarlo por nombre o SKU.
+                    Van a entrar al WMS <strong>sin etiqueta</strong> (el operador salta el paso de etiquetado).
+                    Si el SKU leído es correcto, <strong>no le asignes otro producto</strong>: dejalo así y
+                    reetiquetá desde Admin → Recepciones → "Sin etiqueta ML" cuando ML asigne el código.
+                    Usá el buscador solo si el SKU está mal leído.
                   </p>
                 </div>
               </div>
