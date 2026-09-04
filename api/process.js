@@ -2,6 +2,14 @@ const config = {
   maxDuration: 300,
 };
 
+// Cuadre puro de la extraccion contra el neto (cuadre.js, testeado en node).
+const { evaluarCuadre } = require("../cuadre.js");
+
+// Presupuesto minimo que tiene que quedar para lanzar una SEGUNDA extraccion
+// (120s de timeout de Claude + margen). Si no alcanza, se devuelve la primera
+// y el frontend la frena con su cuadre, como siempre.
+const MIN_MS_PARA_REINTENTO = 130000;
+
 const VISION_ERRORS = {
   400: "Imagen no válida o corrupta. Intenta tomar la foto de nuevo.",
   401: "Error de autenticación con Google Vision. Verifica GOOGLE_VISION_API_KEY.",
@@ -149,7 +157,11 @@ async function ocrWithVision(imageBase64, apiKey, finPresupuesto, retries = 1) {
 
 // --- Claude Sonnet: structure OCR text into invoice data ---
 
-async function structureWithClaude(ocrText, anthropicKey, finPresupuesto) {
+// `pista` (opcional): texto que se agrega al mensaje del usuario en un
+// reintento — le dice al modelo que la corrida anterior no cuadro con el neto
+// y que revise la asignacion de cantidad/costo por fila. NO cambia el prompt
+// del sistema ni el schema de salida.
+async function structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista = "") {
   // ELIMINADO a proposito: aca habia un corte del OCR a 6.000 caracteres,
   // resto de cuando esto corria en un modelo chico con max_tokens 4000.
   // Cortaba LA COLA de la factura — los ultimos productos Y los totales — sin
@@ -206,7 +218,7 @@ sin indentación y sin espacios entre campos. Nada de texto antes ni después de
     system: systemPrompt,
     messages: [{
       role: "user",
-      content: "Extrae los productos de esta factura:\n\n" + ocrText
+      content: "Extrae los productos de esta factura:\n\n" + ocrText + (pista ? "\n\n" + pista : "")
     }]
   });
 
@@ -352,13 +364,61 @@ async function handler(req, res) {
 
       // Step 2: Structure with Claude Sonnet
       console.log("Step 2: Structuring with Claude Sonnet...");
-      const parsed = await structureWithClaude(ocrText, anthropicKey, finPresupuesto);
+      let parsed = await structureWithClaude(ocrText, anthropicKey, finPresupuesto);
       console.log("Claude extracted", parsed.productos?.length || 0, "products");
+
+      // Step 2b: cuadre contra el neto ANTES de devolver. La estructuracion no
+      // es determinista: con el MISMO OCR (factura 548981, 04-sep-2026) una
+      // corrida devolvio las 19 lineas perfectas y otra corrio cantidad/costo
+      // una fila (suma $2.023.000 vs neto $1.869.000). El frontend ya bloquea
+      // el envio cuando no cuadra, pero recien al final y sin decir que linea.
+      // Aca, si no cuadra y queda presupuesto, se pide UNA segunda extraccion
+      // con la pista del descuadre y se devuelve la que cuadre. Si ninguna
+      // cuadra, se devuelve la primera y el frontend la frena como siempre.
+      // Regla 4: el response dice cuantos intentos hubo y como cuadro cada uno.
+      const cuadre1 = evaluarCuadre(parsed);
+      const extraccion = {
+        intentos: 1,
+        cuadra_intento1: cuadre1.cuadra,
+        delta_intento1: cuadre1.evaluable ? cuadre1.delta : null,
+        cuadra_final: cuadre1.cuadra,
+        reintento_omitido: null,
+      };
+      if (cuadre1.evaluable && cuadre1.cuadra === false) {
+        const restante = finPresupuesto - Date.now();
+        if (restante < MIN_MS_PARA_REINTENTO) {
+          extraccion.reintento_omitido = "sin_presupuesto";
+          console.log("Cuadre falló (delta " + cuadre1.delta + ") y no queda presupuesto para reintentar");
+        } else {
+          console.log("Cuadre falló (suma " + cuadre1.suma + " vs neto " + cuadre1.neto + ", " + cuadre1.unidades + " uds): reintentando la extracción");
+          const pista =
+            "VERIFICACIÓN: en un intento anterior la suma de cantidad × costo_unitario dio " + cuadre1.suma +
+            " pero el NETO de la factura es " + cuadre1.neto + " (diferencia " + cuadre1.delta + "). " +
+            "Casi siempre es porque la cantidad o el precio de una fila se tomó de la fila vecina: el OCR trae " +
+            "las columnas separadas y cada número pertenece a UNA sola fila, en orden. Reasigná fila por fila " +
+            "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control, y comprobá que la " +
+            "suma de todas las líneas sea exactamente el neto antes de responder.";
+          const parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista);
+          const cuadre2 = evaluarCuadre(parsed2);
+          extraccion.intentos = 2;
+          extraccion.cuadra_intento2 = cuadre2.cuadra;
+          extraccion.delta_intento2 = cuadre2.evaluable ? cuadre2.delta : null;
+          if (cuadre2.cuadra === true) {
+            parsed = parsed2;
+            extraccion.cuadra_final = true;
+            console.log("Reintento cuadró: se usa la segunda extracción (" + (parsed2.productos?.length || 0) + " products)");
+          } else {
+            extraccion.cuadra_final = false;
+            console.log("Reintento tampoco cuadró (delta " + cuadre2.delta + "): se devuelve la primera, el frontend la frena");
+          }
+        }
+      }
 
       return res.status(200).json({
         mode: "vision+claude",
         parsed: parsed,
         ocrText: ocrText,
+        extraccion: extraccion,
       });
     }
 
