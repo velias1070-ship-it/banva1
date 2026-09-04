@@ -3,7 +3,7 @@
 "use strict";
 
 const path = require("path");
-const { evaluarCuadre } = require(path.join(__dirname, "..", "cuadre.js"));
+const { evaluarCuadre, repararCantidades } = require(path.join(__dirname, "..", "cuadre.js"));
 
 let fallas = 0;
 function check(nombre, cond, detalle) {
@@ -55,6 +55,48 @@ console.log("evaluarCuadre");
 {
   const r = evaluarCuadre(null);
   check("input nulo no revienta", r.evaluable === false && r.suma === 0);
+}
+
+console.log("\nrepararCantidades");
+{
+  // La forma REAL del fallo: Vision pierde el "3" de la fila, Claude adivina la
+  // cantidad (10) pero precio (28.000) y Valor Total (84.000) vienen bien.
+  const p = { costo_neto: 1869000, productos: [
+    { sku: "ASHD7170230GR", cantidad: 10, costo_unitario: 28000, valor_total: 84000 },
+    { sku: "ASCL50X100BEI", cantidad: 10, costo_unitario: 4300, valor_total: 43000 },
+  ] };
+  const r = repararCantidades(p);
+  check("cantidad adivinada se corrige con valor_total / costo", r.reparadas === 1 && r.parsed.productos[0].cantidad === 3 && r.parsed.productos[0].cantidad_reparada === true, JSON.stringify(r.detalle));
+  check("la linea que ya cuadra no se toca", r.parsed.productos[1].cantidad === 10 && !r.parsed.productos[1].cantidad_reparada);
+  check("no muta el input", p.productos[0].cantidad === 10);
+}
+{
+  // Corrimiento completo (cantidad, costo y total de la fila vecina): la linea
+  // es internamente consistente y NO se puede reparar por fila — lo atrapa el
+  // cuadre global. La funcion no debe inventar nada.
+  const r = repararCantidades({ productos: [{ sku: "X", cantidad: 10, costo_unitario: 4300, valor_total: 43000 }] });
+  check("linea consistente pero corrida: sin cambios", r.reparadas === 0);
+}
+{
+  const r = repararCantidades({ productos: [{ sku: "X", cantidad: 10, costo_unitario: 4300, valor_total: 84000 }] });
+  check("total no divisible por el costo: no se adivina", r.reparadas === 0 && r.parsed.productos[0].cantidad === 10);
+}
+{
+  const r = repararCantidades({ productos: [
+    { sku: "A", cantidad: 3, costo_unitario: 22000, valor_total: 0 },
+    { sku: "B", cantidad: 3, costo_unitario: 0, valor_total: 66000 },
+    { sku: "C", cantidad: 3, costo_unitario: 22000 },
+  ] });
+  check("sin total, sin costo o sin campo: no se toca", r.reparadas === 0);
+}
+{
+  // Los 19 casos reales: con valor_total correcto y TODAS las cantidades en 0
+  // (el modelo no las leyo), la reparacion reconstruye las 125 uds exactas.
+  const p = JSON.parse(JSON.stringify(OK_548981));
+  p.productos.forEach((x) => { x.valor_total = x.cantidad * x.costo_unitario; x.cantidad = 0; });
+  const r = repararCantidades(p);
+  const c = evaluarCuadre(r.parsed);
+  check("548981 con cantidades en 0 se reconstruye entera desde los totales", r.reparadas === 19 && c.cuadra === true && c.unidades === 125, JSON.stringify(c));
 }
 
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");

@@ -3,7 +3,7 @@ const config = {
 };
 
 // Cuadre puro de la extraccion contra el neto (cuadre.js, testeado en node).
-const { evaluarCuadre } = require("../cuadre.js");
+const { evaluarCuadre, repararCantidades } = require("../cuadre.js");
 
 // Presupuesto minimo que tiene que quedar para lanzar una SEGUNDA extraccion
 // (120s de timeout de Claude + margen). Si no alcanza, se devuelve la primera
@@ -179,6 +179,8 @@ REGLAS:
 - Nombre: descripción del producto
 - Cantidad: "Cant", "Qty", "Unid." — número entero
 - Costo unitario neto (sin IVA): "P. Unitario", "Precio Unit", "Valor Unit" — número entero sin separador de miles
+- valor_total: el total de ESA línea tal como está impreso ("Valor Total", "Total", "Subtotal" de la fila) — entero sin separador de miles. TRANSCRIBILO, no lo calcules; si la fila no lo trae, 0. Sirve de control: cantidad × costo_unitario debe dar valor_total
+- El OCR suele traer las columnas separadas (primero todos los códigos, después las cantidades sueltas, después precios y totales en pares). Los precios y totales se leen bien; las cantidades de un dígito a veces faltan. Cuando dudes de una cantidad, derivala de valor_total ÷ costo_unitario
 - Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos). Devuelve como entero: 3400
 - Montos totales al final: Neto, IVA (19%), Total
 - NO inventes productos ni SKUs. Si una línea es ilegible o dudosa NO la omitas en silencio: inclúyela con confianza "baja", con lo que hayas podido leer, y cantidad 0 si la cantidad no se lee. El sistema le mostrará esa línea al operador; una línea omitida desaparece sin que nadie lo note
@@ -191,7 +193,7 @@ REFERENCIAS DE ORDEN DE COMPRA (opcionales, NO afectan la lista de productos):
 
 Responde SOLO JSON válido, COMPACTO: todo en una sola línea, sin saltos de línea,
 sin indentación y sin espacios entre campos. Nada de texto antes ni después del JSON.
-{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"confianza":"alta"}]}`;
+{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"valor_total":0,"confianza":"alta"}]}`;
 
   // Modelos en orden de preferencia. Si Anthropic retira el primero
   // (404 not_found_error), cae automaticamente al siguiente y la app NO se cae.
@@ -367,6 +369,18 @@ async function handler(req, res) {
       let parsed = await structureWithClaude(ocrText, anthropicKey, finPresupuesto);
       console.log("Claude extracted", parsed.productos?.length || 0, "products");
 
+      // Step 2a: reparacion DETERMINISTA por linea (cuadre.js). Vision pierde
+      // las cantidades de un digito pero lee bien precio y "Valor Total" de cada
+      // fila: si cantidad x costo != total y total es multiplo del costo, la
+      // cantidad es total / costo. Medido en la 548981: la corrida del operador
+      // traia 127 uds / $2.023.000 contra 125 / $1.869.000 con esos totales
+      // intactos en el texto.
+      const rep1 = repararCantidades(parsed);
+      if (rep1.reparadas > 0) {
+        parsed = rep1.parsed;
+        console.log("Cantidades reparadas con valor_total:", JSON.stringify(rep1.detalle));
+      }
+
       // Step 2b: cuadre contra el neto ANTES de devolver. La estructuracion no
       // es determinista: con el MISMO OCR (factura 548981, 04-sep-2026) una
       // corrida devolvio las 19 lineas perfectas y otra corrio cantidad/costo
@@ -379,6 +393,7 @@ async function handler(req, res) {
       const cuadre1 = evaluarCuadre(parsed);
       const extraccion = {
         intentos: 1,
+        reparadas_intento1: rep1.reparadas,
         cuadra_intento1: cuadre1.cuadra,
         delta_intento1: cuadre1.evaluable ? cuadre1.delta : null,
         cuadra_final: cuadre1.cuadra,
@@ -396,11 +411,18 @@ async function handler(req, res) {
             " pero el NETO de la factura es " + cuadre1.neto + " (diferencia " + cuadre1.delta + "). " +
             "Casi siempre es porque la cantidad o el precio de una fila se tomó de la fila vecina: el OCR trae " +
             "las columnas separadas y cada número pertenece a UNA sola fila, en orden. Reasigná fila por fila " +
-            "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control, y comprobá que la " +
-            "suma de todas las líneas sea exactamente el neto antes de responder.";
-          const parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista);
+            "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control — transcribí ese " +
+            "valor_total y derivá la cantidad como valor_total ÷ costo_unitario —, y comprobá que la suma de " +
+            "todas las líneas sea exactamente el neto antes de responder.";
+          let parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista);
+          const rep2 = repararCantidades(parsed2);
+          if (rep2.reparadas > 0) {
+            parsed2 = rep2.parsed;
+            console.log("Cantidades reparadas en el reintento:", JSON.stringify(rep2.detalle));
+          }
           const cuadre2 = evaluarCuadre(parsed2);
           extraccion.intentos = 2;
+          extraccion.reparadas_intento2 = rep2.reparadas;
           extraccion.cuadra_intento2 = cuadre2.cuadra;
           extraccion.delta_intento2 = cuadre2.evaluable ? cuadre2.delta : null;
           if (cuadre2.cuadra === true) {
