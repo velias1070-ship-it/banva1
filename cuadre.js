@@ -43,5 +43,34 @@
     };
   }
 
-  return { evaluarCuadre: evaluarCuadre };
+  // Reparacion DETERMINISTA por linea, con lo que el OCR si lee bien.
+  // Medido (548981, 04-sep-2026): Vision pierde las cantidades de UN digito
+  // (3, 5) pero lee bien precios y "Valor Total" de cada fila (los 19 totales
+  // presentes en el texto). Si cantidad x costo != valor_total y valor_total es
+  // multiplo exacto del costo, la cantidad correcta es valor_total / costo.
+  // No toca lineas sin total, sin costo, o cuya division no da entero (ahi no
+  // hay certeza y se deja al cuadre global / al operador). Devuelve una copia.
+  function repararCantidades(parsed) {
+    const productos = Array.isArray(parsed && parsed.productos) ? parsed.productos : [];
+    const detalle = [];
+    const nuevos = productos.map(function (p) {
+      if (!p) return p;
+      const cantidad = num(p.cantidad);
+      const costo = num(p.costo_unitario);
+      const total = num(p.valor_total);
+      if (costo <= 0 || total <= 0) return p;
+      if (cantidad * costo === total) return p;
+      if (total % costo !== 0) return p;
+      const corregida = total / costo;
+      detalle.push({ sku: p.sku, antes: cantidad, despues: corregida, costo: costo, valor_total: total });
+      return Object.assign({}, p, { cantidad: corregida, cantidad_reparada: true });
+    });
+    return {
+      parsed: Object.assign({}, parsed, { productos: nuevos }),
+      reparadas: detalle.length,
+      detalle: detalle,
+    };
+  }
+
+  return { evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades };
 });
