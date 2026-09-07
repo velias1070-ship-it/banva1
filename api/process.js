@@ -3,7 +3,7 @@ const config = {
 };
 
 // Cuadre puro de la extraccion contra el neto (cuadre.js, testeado en node).
-const { evaluarCuadre, repararCantidades, compararProductos } = require("../cuadre.js");
+const { evaluarCuadre, repararCantidades, compararProductos, verificarCantidadPorOrdenOcr } = require("../cuadre.js");
 
 // Presupuesto minimo que tiene que quedar para lanzar una SEGUNDA extraccion
 // (120s de timeout de Claude + margen). Si no alcanza, se devuelve la primera
@@ -500,6 +500,34 @@ async function handler(req, res) {
           } else {
             extraccion.consenso = { corrido: true, arbitrado_por_cuadre: true };
           }
+        }
+      }
+
+      // Step 2c: verificacion DETERMINISTA por el orden del OCR (cuadre.js).
+      // Cubre el punto ciego del consenso: cuando los DOS modelos permutan
+      // igual (medido: Bars↔Flowers identicos en ambos, 1 de 9 corridas), la
+      // cantidad pegada antes de la descripcion en el stream de Vision es un
+      // ancla que ningun modelo pisa. Marca con el MISMO campo `consenso`
+      // (candado F + botones); si la linea ya venia marcada, prevalece la
+      // cantidad del orden como "otra" — es la evidencia mas dura.
+      {
+        const orden = verificarCantidadPorOrdenOcr(ocrText, parsed);
+        extraccion.orden_ocr = {
+          evaluable: orden.evaluable,
+          verificadas: orden.verificadas,
+          alertas: orden.alertas.map(function (a) { return a.sku; }),
+        };
+        if (orden.alertas.length > 0) {
+          const porSku = {};
+          orden.alertas.forEach(function (a) { porSku[a.sku] = a; });
+          parsed.productos.forEach(function (p) {
+            const sku = (p && p.sku ? String(p.sku) : "").toUpperCase().trim();
+            const a = porSku[sku];
+            if (!a) return;
+            p.consenso = Object.assign({}, p.consenso, { otra_cantidad: a.cantidad_ocr, fuente: "orden_ocr" });
+            p.confianza = "baja";
+          });
+          console.log("Orden OCR: " + orden.alertas.length + " linea(s) con cantidad distinta a la del texto:", JSON.stringify(extraccion.orden_ocr.alertas));
         }
       }
 

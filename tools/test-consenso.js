@@ -18,7 +18,7 @@
 "use strict";
 
 const path = require("path");
-const { compararProductos } = require(path.join(__dirname, "..", "cuadre.js"));
+const { compararProductos, verificarCantidadPorOrdenOcr } = require(path.join(__dirname, "..", "cuadre.js"));
 
 let fallas = 0;
 function check(nombre, cond, detalle) {
@@ -120,6 +120,88 @@ console.log("compararProductos");
   const r = compararProductos(a, armar([["TXV24QLBRBA15", 16, 6700]]));
   check("normaliza SKU antes de comparar", r.evaluable && r.coinciden === 1 && r.discrepancias.length === 0,
     JSON.stringify(r));
+}
+
+// ------------------------------------------------------------
+// verificarCantidadPorOrdenOcr — ancla DETERMINISTA contra el error
+// correlacionado (bateria 07-sep: Bars↔Flowers permutados IGUAL por los DOS
+// modelos en 1 de 9 corridas; el consenso no ve lo que ambos fallan igual).
+// En el stream de Vision la cantidad viene pegada ANTES de su descripcion
+// ([16,40][Bars,Flowers] · [32][Beige]): eso ningun modelo lo puede pisar.
+// Fixture = el texto OCR REAL de la 549298 (Vision, sin editar).
+// ------------------------------------------------------------
+const OCR_549298 = [
+  "GR15", "Código", "TXV24QLBRBA15", "TXV24QLBRFL15", "Unid.", "16", "40",
+  "Descripción del Producto", "Quilt Bruselas Bars Single", "Quilt Bruselas Flowers Single",
+  "Precio U.", "Descto.", "Valor Total", "107.200", "6.700", "268.000", "6.700",
+  "224.000", "32", "Quilt Breda 15P Beige", "7.000",
+  "280.000", "40", "Quilt Breda 15P Gris", "7.000",
+  "168.000", "24", "Quilt Breda 15P Rosa", "7.000",
+  "112.000", "16", "Quilt Breda 15P Verde", "7.000",
+  "65.600", "8", "Quilt Bruselas Marron 20P", "8.200",
+  "72.800", "8", "Quilt Bruselas Café 25P", "9.100",
+  "640.000", "80", "Quilt Breda 20P Gris", "8.000",
+  "240.000", "30", "Quilt Breda 20P Verde", "8.000",
+  "40", "Quilt Breda 20P Beige", "320.000", "8.000",
+  "40", "Quilt Breda 25P Gris", "9.000",
+  "360.000", "5", "Quilt Breda 30P Rosa", "10.000",
+  "50.000", "5", "XW26PMVC15GR TXW26PMVC15GR", "XW26PMVC15TE TXW26PMVC15TE",
+  "Quilt Breda 30P Celeste", "10.000", "50.000",
+  "28", "12", "Plumon VL Corduroy Sherpa 15P Gris", "Plumon VL Corduroy Sherpa 15P Terracota",
+  "14.000", "392.000", "14.000", "168.000", "Total Unidades: 424",
+].join("\n");
+
+const NOMBRES = {
+  TXV24QLBRBA15: "Quilt Bruselas Bars Single", TXV24QLBRFL15: "Quilt Bruselas Flowers Single",
+  TXV25QLBRBG15: "Quilt Breda 15P Beige", TXV25QLBRGR15: "Quilt Breda 15P Gris",
+  TXV25QLBRRS15: "Quilt Breda 15P Rosa", TXV25QLBRVD15: "Quilt Breda 15P Verde",
+  TXV24QLBRMA20: "Quilt Bruselas Marron 20P", TXV24QLBRCF25: "Quilt Bruselas Café 25P",
+  TXV25QLBRGR20: "Quilt Breda 20P Gris", TXV25QLBRVD20: "Quilt Breda 20P Verde",
+  TXV25QLBRBG20: "Quilt Breda 20P Beige", TXV25QLBRGR25: "Quilt Breda 25P Gris",
+  TXV25QLBRRS30: "Quilt Breda 30P Rosa", TXV25QLBRCE30: "Quilt Breda 30P Celeste",
+  TXW26PMVC15GR: "Plumon VL Corduroy Sherpa 15P Gris", TXW26PMVC15TE: "Plumon VL Corduroy Sherpa 15P Terracota",
+};
+function conNombres(parsed) {
+  return { productos: parsed.productos.map((p) => Object.assign({}, p, { nombre: NOMBRES[p.sku] || "" })) };
+}
+
+console.log("\nverificarCantidadPorOrdenOcr");
+{
+  const r = verificarCantidadPorOrdenOcr(OCR_549298, conNombres(CORRECTA_549298));
+  check("extraccion correcta: cero alertas y 15 filas verificadas (Celeste queda fuera: codigos en medio)",
+    r.evaluable && r.alertas.length === 0 && r.verificadas === 15, JSON.stringify(r));
+}
+{
+  // EL residuo: Bars↔Flowers permutados igual por los dos modelos. El orden
+  // del OCR dice Bars=16 y Flowers=40 — determinista, atrapado siempre.
+  const r = verificarCantidadPorOrdenOcr(OCR_549298, conNombres(PROD_549298));
+  const skus = r.alertas.map((a) => a.sku).sort();
+  check("las 5 permutadas de prod se detectan por orden del OCR (Bars/Flowers incluidas)",
+    skus.join(",") === "TXV24QLBRBA15,TXV24QLBRFL15,TXV25QLBRBG15,TXV25QLBRGR15,TXV25QLBRRS15",
+    JSON.stringify(r.alertas));
+  const bars = r.alertas.find((a) => a.sku === "TXV24QLBRBA15");
+  check("la alerta trae la cantidad que dicta el orden del OCR",
+    bars && bars.cantidad_extraida === 40 && bars.cantidad_ocr === 16, JSON.stringify(bars));
+}
+{
+  const r = verificarCantidadPorOrdenOcr("", conNombres(CORRECTA_549298));
+  check("sin ocrText: no evaluable, cero alertas (Regla 1)", r.evaluable === false && r.alertas.length === 0);
+}
+{
+  const r = verificarCantidadPorOrdenOcr("texto sin tabla\nnada que ver\n123.456", conNombres(CORRECTA_549298));
+  check("OCR sin el patron cantidad→descripcion: cero alertas, cero ruido",
+    r.alertas.length === 0 && r.verificadas === 0, JSON.stringify(r));
+}
+{
+  // Dos productos con el MISMO nombre: no se puede saber cual es cual — se
+  // saltan ambos en vez de adivinar.
+  const dosIguales = { productos: [
+    { sku: "A1", nombre: "Quilt Breda 15P Beige", cantidad: 32 },
+    { sku: "A2", nombre: "Quilt Breda 15P Beige", cantidad: 9 },
+  ] };
+  const r = verificarCantidadPorOrdenOcr(OCR_549298, dosIguales);
+  check("nombre duplicado en la extraccion: esas filas no se verifican (sin adivinar)",
+    r.alertas.length === 0, JSON.stringify(r.alertas));
 }
 
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");

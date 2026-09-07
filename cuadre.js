@@ -150,5 +150,75 @@
     return out;
   }
 
-  return { evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos };
+  // Verificacion DETERMINISTA de cantidades por el ORDEN del texto OCR.
+  // Bateria 07-sep-2026 (549298): los DOS modelos permutaron Bars↔Flowers
+  // IGUAL en 1 de 9 corridas — el consenso no ve lo que ambos fallan igual.
+  // Pero en el stream de Vision la cantidad de una fila viene pegada ANTES de
+  // su descripcion ("16, 40, Bars, Flowers" · "32, Quilt Breda 15P Beige"):
+  // un ancla que ningun modelo puede pisar. Regla conservadora: una corrida de
+  // K enteros pelados (sin separador de miles, 1-4 digitos) seguida —salvo
+  // lineas sin digitos, como el header "Descripcion del Producto"— de K lineas
+  // que calzan 1:1 con nombres de productos extraidos, se zipea en orden.
+  // Cualquier otra forma NO se evalua (cero adivinanza, Regla 1); un nombre
+  // repetido en la extraccion tampoco. Devuelve alertas donde la cantidad
+  // extraida difiere de la que dicta el orden — deciden el candado F y el
+  // operador contra el papel, no esta funcion.
+  function normTexto(s) {
+    const base = (s == null ? "" : String(s)).toLowerCase();
+    let t;
+    try { t = base.normalize("NFD").replace(/[̀-ͯ]/g, ""); } catch (e) { t = base; }
+    return t.replace(/[^a-z0-9]+/g, " ").trim();
+  }
+
+  function verificarCantidadPorOrdenOcr(ocrText, parsed) {
+    const productos = Array.isArray(parsed && parsed.productos) ? parsed.productos : [];
+    const out = { evaluable: false, alertas: [], verificadas: 0 };
+    if (!ocrText || productos.length === 0) return out;
+    out.evaluable = true;
+
+    // nombre normalizado → producto (solo nombres UNICOS: con duplicados no
+    // hay forma de saber cual fila es cual).
+    const porNombre = {};
+    const repetidos = new Set();
+    productos.forEach(function (p) {
+      const n = normTexto(p && p.nombre);
+      if (!n) return;
+      if (porNombre[n]) { repetidos.add(n); return; }
+      porNombre[n] = p;
+    });
+    repetidos.forEach(function (n) { delete porNombre[n]; });
+
+    const lineas = String(ocrText).split(/\n/).map(function (l) { return l.trim(); }).filter(Boolean);
+    const esQty = function (l) { return /^\d{1,4}$/.test(l); };
+    const esDesc = function (l) { return !!porNombre[normTexto(l)]; };
+    const esSaltable = function (l) { return !/\d/.test(l); }; // header sin digitos
+
+    let runQ = [];
+    let i = 0;
+    while (i < lineas.length) {
+      const l = lineas[i];
+      if (esQty(l)) { runQ.push(Number(l)); i++; continue; }
+      if (esDesc(l)) {
+        const descs = [];
+        while (i < lineas.length && esDesc(lineas[i])) { descs.push(lineas[i]); i++; }
+        if (descs.length === runQ.length && descs.length > 0) {
+          descs.forEach(function (d, j) {
+            const p = porNombre[normTexto(d)];
+            out.verificadas++;
+            if (Number(p.cantidad) !== runQ[j]) {
+              out.alertas.push({ sku: (p.sku || "").toUpperCase().trim(), cantidad_extraida: Number(p.cantidad), cantidad_ocr: runQ[j] });
+            }
+          });
+        }
+        runQ = [];
+        continue;
+      }
+      if (esSaltable(l)) { i++; continue; } // no rompe la corrida de cantidades
+      runQ = []; // linea con digitos que no es cantidad ni descripcion: corta
+      i++;
+    }
+    return out;
+  }
+
+  return { evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
 });
