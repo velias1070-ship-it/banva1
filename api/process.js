@@ -161,7 +161,11 @@ async function ocrWithVision(imageBase64, apiKey, finPresupuesto, retries = 1) {
 // reintento — le dice al modelo que la corrida anterior no cuadro con el neto
 // y que revise la asignacion de cantidad/costo por fila. NO cambia el prompt
 // del sistema ni el schema de salida.
-async function structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista = "") {
+// `modeloAlterno`: la corrida de CONSENSO usa el orden inverso de MODELOS.
+// Medido (549298, E2E 07-sep): dos corridas del MISMO modelo pueden fallar
+// IGUAL en la misma ambiguedad (Bars↔Flowers permutados en ambas) y el
+// consenso no ve errores correlacionados. Un modelo distinto decorrelaciona.
+async function structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista = "", modeloAlterno = false) {
   // ELIMINADO a proposito: aca habia un corte del OCR a 6.000 caracteres,
   // resto de cuando esto corria en un modelo chico con max_tokens 4000.
   // Cortaba LA COLA de la factura — los ultimos productos Y los totales — sin
@@ -176,12 +180,13 @@ async function structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista 
 REGLAS:
 - Extrae SOLO productos de la factura (líneas con SKU, nombre, cantidad, precio)
 - SKU: código alfanumérico EXACTO como aparece en el texto (columna "Código" o "Cod.Alter."). NO lo inventes ni modifiques. Si hay dos códigos por línea (Código y Cod.Alter.), usa el segundo (Cod.Alter.)
+- CUIDADO al emparejar códigos con filas: el OCR suele traer el bloque de códigos REVUELTO, partido en varios pedazos y con duplicados (la plantilla imprime el mismo código en dos columnas). NO asignes códigos a las descripciones por posición. Empareja cada código con su descripción por CONTENIDO: las letras y números del código abrevian el producto (modelo, colección, talla/plazas y color de la descripción — p.ej. un código terminado en BG15 va con la descripción "... 15P Beige", GR con Gris, VD con Verde, RS con Rosa, TE con Terracota). Cada código impreso corresponde a UNA sola fila: no repitas un código en dos filas ni dejes filas sin su código
 - Nombre: descripción del producto
 - Cantidad: "Cant", "Qty", "Unid." — número entero
 - Costo unitario neto (sin IVA): "P. Unitario", "Precio Unit", "Valor Unit" — número entero sin separador de miles
 - valor_total: el total de ESA línea tal como está impreso ("Valor Total", "Total", "Subtotal" de la fila) — entero sin separador de miles. TRANSCRIBILO, no lo calcules; si la fila no lo trae, 0. Sirve de control: cantidad × costo_unitario debe dar valor_total
-- El OCR suele traer las columnas separadas (primero todos los códigos, después las cantidades sueltas, después precios y totales en pares). Los precios y totales se leen bien; las cantidades de un dígito a veces faltan. Cuando dudes de una cantidad, derivala de valor_total ÷ costo_unitario
-- CUIDADO con la asignación por fila: en estas plantillas el "Valor Total" de una fila suele aparecer en el texto ANTES de su grupo cantidad/descripción/precio, y la cantidad suele venir INMEDIATAMENTE antes de la descripción. Ancla cada cantidad a la descripción que la sigue, no al total más cercano. Un total tomado de la fila vecina con el mismo precio unitario da una cantidad "consistente" pero AJENA — es el error más caro
+- El OCR suele traer las columnas separadas (primero todos los códigos, después las cantidades sueltas, después precios y totales en pares). Los precios y totales se leen bien; las cantidades de un dígito a veces faltan. Si la cantidad de una fila NO está impresa o no es legible, poné cantidad 0 y transcribí su valor_total: el sistema la deriva. Si la cantidad SÍ está impresa, ESA manda: NUNCA la cambies para que calce con un total
+- CUIDADO con la asignación por fila: en estas plantillas el "Valor Total" de una fila suele aparecer en el texto ANTES de su grupo cantidad/descripción/precio, y la cantidad suele venir INMEDIATAMENTE antes de la descripción (o en un bloque de cantidades que respeta el orden de las filas). Ancla cada cantidad a su descripción por orden, no al total más cercano. Un total tomado de la fila vecina con el mismo precio unitario da una cantidad "consistente" pero AJENA — es el error más caro
 - total_unidades: el número que sigue a "Total Unidades" al pie de la tabla — entero, TRANSCRITO. Si no aparece, 0. Control final: la suma de las cantidades debe dar total_unidades
 - Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos). Devuelve como entero: 3400
 - Montos totales al final: Neto, IVA (19%), Total
@@ -200,7 +205,8 @@ sin indentación y sin espacios entre campos. Nada de texto antes ni después de
   // Modelos en orden de preferencia. Si Anthropic retira el primero
   // (404 not_found_error), cae automaticamente al siguiente y la app NO se cae.
   // Esto evita que un modelo retirado vuelva a romper el procesamiento de facturas.
-  const MODELOS = ["claude-sonnet-4-6", "claude-opus-4-8"];
+  const MODELOS_BASE = ["claude-sonnet-4-6", "claude-opus-4-8"];
+  const MODELOS = modeloAlterno ? MODELOS_BASE.slice().reverse() : MODELOS_BASE;
 
   // DESCARTADO a proposito: output_config {effort:"low"}. Recortaba algo de
   // latencia, pero dos revisiones independientes marcaron el mismo riesgo: menos
@@ -433,7 +439,7 @@ async function handler(req, res) {
           console.log(fallo1
             ? "Cuadre falló (suma " + cuadre1.suma + " vs neto " + cuadre1.neto + ", " + cuadre1.unidades + " uds): reintentando la extracción"
             : "Cuadre OK: segunda extracción independiente para consenso");
-          let parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista);
+          let parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista, true);
           const rep2 = repararCantidades(parsed2);
           if (rep2.reparadas > 0) {
             parsed2 = rep2.parsed;

@@ -57,8 +57,14 @@
   // Reparacion DETERMINISTA por linea, con lo que el OCR si lee bien.
   // Medido (548981, 04-sep-2026): Vision pierde las cantidades de UN digito
   // (3, 5) pero lee bien precios y "Valor Total" de cada fila (los 19 totales
-  // presentes en el texto). Si cantidad x costo != valor_total y valor_total es
+  // presentes en el texto). Si la cantidad NO se leyo (0) y valor_total es
   // multiplo exacto del costo, la cantidad correcta es valor_total / costo.
+  // SOLO repara cantidades en 0 (no leidas): una cantidad POSITIVA impresa
+  // manda sobre el total, porque en plantillas como la de Idetex el "Valor
+  // Total" viene impreso UNA fila corrido y "repararla" escribia la cantidad
+  // de la fila vecina — y como las dos extracciones del consenso reparaban
+  // igual, el error salia CORRELACIONADO e invisible (549298, 07-sep-2026:
+  // Bars con 16 impreso + total ajeno 268.000 → 40 falso en ambas corridas).
   // No toca lineas sin total, sin costo, o cuya division no da entero (ahi no
   // hay certeza y se deja al cuadre global / al operador). Devuelve una copia.
   function repararCantidades(parsed) {
@@ -69,8 +75,8 @@
       const cantidad = num(p.cantidad);
       const costo = num(p.costo_unitario);
       const total = num(p.valor_total);
+      if (cantidad > 0) return p; // impresa y legible: manda sobre el total
       if (costo <= 0 || total <= 0) return p;
-      if (cantidad * costo === total) return p;
       if (total % costo !== 0) return p;
       const corregida = total / costo;
       detalle.push({ sku: p.sku, antes: cantidad, despues: corregida, costo: costo, valor_total: total });

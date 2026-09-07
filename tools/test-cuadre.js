@@ -84,16 +84,32 @@ console.log("evaluarCuadre");
 
 console.log("\nrepararCantidades");
 {
-  // La forma REAL del fallo: Vision pierde el "3" de la fila, Claude adivina la
-  // cantidad (10) pero precio (28.000) y Valor Total (84.000) vienen bien.
+  // La forma REAL del fallo 548981: Vision pierde el "3" de la fila y el modelo
+  // entrega cantidad 0 (regla del prompt: cantidad no legible = 0, jamas
+  // adivinada) con precio (28.000) y Valor Total (84.000) bien transcritos.
   const p = { costo_neto: 1869000, productos: [
-    { sku: "ASHD7170230GR", cantidad: 10, costo_unitario: 28000, valor_total: 84000 },
+    { sku: "ASHD7170230GR", cantidad: 0, costo_unitario: 28000, valor_total: 84000 },
     { sku: "ASCL50X100BEI", cantidad: 10, costo_unitario: 4300, valor_total: 43000 },
   ] };
   const r = repararCantidades(p);
-  check("cantidad adivinada se corrige con valor_total / costo", r.reparadas === 1 && r.parsed.productos[0].cantidad === 3 && r.parsed.productos[0].cantidad_reparada === true, JSON.stringify(r.detalle));
+  check("cantidad no leida (0) se deriva de valor_total / costo", r.reparadas === 1 && r.parsed.productos[0].cantidad === 3 && r.parsed.productos[0].cantidad_reparada === true, JSON.stringify(r.detalle));
   check("la linea que ya cuadra no se toca", r.parsed.productos[1].cantidad === 10 && !r.parsed.productos[1].cantidad_reparada);
-  check("no muta el input", p.productos[0].cantidad === 10);
+  check("no muta el input", p.productos[0].cantidad === 0);
+}
+{
+  // Regresion 549298 (07-sep-2026, medida en E2E): en la plantilla Idetex el
+  // Valor Total viene impreso UNA fila corrido, asi que "reparar" una cantidad
+  // POSITIVA con el total escribe la cantidad DE LA FILA VECINA — y como las
+  // dos extracciones reparaban igual, el error salia correlacionado y el
+  // consenso no lo veia (Bars 16 impreso + total 268.000 ajeno → 40 falso).
+  // Una cantidad impresa y legible MANDA sobre el total: no se pisa.
+  const p = { productos: [
+    { sku: "TXV24QLBRBA15", cantidad: 16, costo_unitario: 6700, valor_total: 268000 },
+  ] };
+  const r = repararCantidades(p);
+  check("cantidad positiva con total inconsistente: NO se pisa (total corrido)",
+    r.reparadas === 0 && r.parsed.productos[0].cantidad === 16 && !r.parsed.productos[0].cantidad_reparada,
+    JSON.stringify(r.detalle));
 }
 {
   // Corrimiento completo (cantidad, costo y total de la fila vecina): la linea
