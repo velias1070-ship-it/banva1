@@ -351,6 +351,37 @@
   }
 
   // ------------------------------------------------------------
+  // Candado F — consenso entre las dos extracciones del servidor.
+  // Origen: factura 549298 (07-sep-2026). Cantidades PERMUTADAS entre lineas
+  // del MISMO precio, con sku↔nombre bien pareados: cada linea cuadraba con su
+  // Valor Total y la suma daba el neto exacto — invisible para el cuadre y
+  // para los candados A/B'/E1/E2 (ninguno mira la CANTIDAD). El servidor corre
+  // dos extracciones independientes y marca con `consenso.otra_cantidad` las
+  // lineas donde no coinciden. Clase "accion": re-escanear solo vuelve a tirar
+  // el dado — el remedio es cotejar contra el papel y confirmar/corregir la
+  // cantidad (eso setea consensoResuelto).
+  // ------------------------------------------------------------
+  function checkConsenso(productos) {
+    const out = [];
+    (productos || []).forEach(function (p, idx) {
+      if (!p || !p.consenso) return;
+      if (p.consensoResuelto) return;
+      if (!(Number(p.cantidad) > 0)) return; // pendiente de accion: candado D la cubre
+      const otra = Number(p.consenso.otra_cantidad);
+      if (!Number.isFinite(otra) || otra < 0) return;
+      out.push({
+        tipo: "consenso_cantidad",
+        idx: idx,
+        sku: normSku(p.sku),
+        mensaje: "La linea " + (idx + 1) + " (" + normSku(p.sku) + (p.nombreDict ? " · " + p.nombreDict : "") +
+          "): la factura se leyo DOS veces y las cantidades no coinciden (" + (Number(p.cantidad) || 0) +
+          " vs " + otra + " un.). Conta contra el papel y confirma o corrige la cantidad en la linea.",
+      });
+    });
+    return out;
+  }
+
+  // ------------------------------------------------------------
   // Evaluacion completa. Devuelve bloqueos (impiden imprimir y enviar) con
   // mensajes listos para mostrar. Debe llamarse sobre el estado VIVO
   // (extractedProducts post-edicion) — nunca sobre un snapshot del escaneo.
@@ -362,7 +393,7 @@
   //   eliminar). Mezclar ambas bajo el cartel "no toques nada, re-escanea"
   //   dejaba al operador re-escaneando en loop una linea que el papel no deja
   //   leer.
-  const CLASE_ACCION = { linea_descartable: true };
+  const CLASE_ACCION = { linea_descartable: true, consenso_cantidad: true };
 
   function evaluarCandados(input) {
     const productos = (input && input.productos) || [];
@@ -381,6 +412,7 @@
 
     checkCodigosFactura(ocrText, productos, skusCatalogo).forEach(function (v) { bloqueos.push(v); });
     checkDescartes(productos).forEach(function (v) { bloqueos.push(v); });
+    checkConsenso(productos).forEach(function (v) { bloqueos.push(v); });
 
     bloqueos.forEach(function (b) { b.clase = CLASE_ACCION[b.tipo] ? "accion" : "reescanear"; });
     return {
@@ -397,6 +429,7 @@
     checkCorrimientoVecino: checkCorrimientoVecino,
     checkCodigosFactura: checkCodigosFactura,
     checkDescartes: checkDescartes,
+    checkConsenso: checkConsenso,
     _internos: { numTokens: numTokens, tokens: tokens, jaccard: jaccard, levenshtein: levenshtein },
   };
 });

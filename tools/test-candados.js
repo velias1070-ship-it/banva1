@@ -472,6 +472,61 @@ console.log("CASO 14 — sin catalogo, el fragmento NO se descarta (falla cerrad
 }
 
 // ------------------------------------------------------------
+// CASO 15 — Candado F (consenso): factura 549298 (07-sep-2026). Las dos
+// extracciones independientes del servidor no coincidieron en la cantidad de
+// una linea (permutacion dentro del mismo precio — invisible para el cuadre y
+// para los candados A/B'/E: sku↔nombre venian BIEN pareados y cada linea
+// cuadraba con su total). El servidor marca la linea con `consenso` y el
+// operador DEBE resolverla contra el papel antes de enviar. Clase "accion":
+// re-escanear solo vuelve a tirar el dado; el remedio ES mirar la factura.
+// ------------------------------------------------------------
+console.log("CASO 15 — consenso discrepante bloquea hasta que el operador resuelve:");
+{
+  const conConsenso = [
+    Object.assign(linea("TXV24QLBRBA15", "Quilt Bruselas Bars Single", 40, 6700,
+      { nombreDict: "Quilt Bruselas Bars Single", matched: true }), { consenso: { otra_cantidad: 16 } }),
+    Object.assign(linea("TXV24QLBRFL15", "Quilt Bruselas Flowers Single", 16, 6700,
+      { nombreDict: "Quilt Bruselas Flowers Single", matched: true }), { consenso: { otra_cantidad: 40 } }),
+  ];
+  const res = Locks.evaluarCandados({ productos: conConsenso, ocrText: "", skusCatalogo: [] });
+  const f = res.bloqueos.filter(b => b.tipo === "consenso_cantidad");
+  check("dos lineas con consenso discrepante = dos bloqueos clase accion",
+    f.length === 2 && f.every(b => b.clase === "accion"),
+    JSON.stringify(res.bloqueos.map(b => b.tipo + "/" + b.clase)));
+  check("el mensaje trae LAS DOS cantidades para cotejar contra el papel",
+    !!f[0] && f[0].mensaje.indexOf("40") !== -1 && f[0].mensaje.indexOf("16") !== -1, f[0] && f[0].mensaje);
+
+  const resuelto = conConsenso.map(p => Object.assign({}, p, { consensoResuelto: true }));
+  const res2 = Locks.evaluarCandados({ productos: resuelto, ocrText: "", skusCatalogo: [] });
+  check("resuelto por el operador: el candado se apaga",
+    res2.bloqueos.filter(b => b.tipo === "consenso_cantidad").length === 0,
+    JSON.stringify(res2.bloqueos.map(b => b.tipo)));
+}
+{
+  const sinConsenso = [
+    linea("TXV24QLBRBA15", "Quilt Bruselas Bars Single", 16, 6700,
+      { nombreDict: "Quilt Bruselas Bars Single", matched: true }),
+  ];
+  const res = Locks.evaluarCandados({ productos: sinConsenso, ocrText: "", skusCatalogo: [] });
+  check("linea sin campo consenso: cero ruido",
+    res.bloqueos.filter(b => b.tipo === "consenso_cantidad").length === 0,
+    JSON.stringify(res.bloqueos.map(b => b.tipo)));
+}
+{
+  // Linea con cantidad 0 y consenso: el candado D ya la obliga a completar o
+  // eliminar — F se calla para no duplicar alarma sobre la misma linea.
+  const cero = [
+    Object.assign(linea("TXV24QLBRBA15", "Quilt Bruselas Bars Single", 0, 6700,
+      { nombreDict: "Quilt Bruselas Bars Single", matched: true }), { consenso: { otra_cantidad: 16 } }),
+  ];
+  const res = Locks.evaluarCandados({ productos: cero, ocrText: "", skusCatalogo: [] });
+  check("cantidad 0 con consenso: la cubre el candado D, F no duplica",
+    res.bloqueos.filter(b => b.tipo === "consenso_cantidad").length === 0 &&
+    res.bloqueos.some(b => b.tipo === "linea_descartable"),
+    JSON.stringify(res.bloqueos.map(b => b.tipo)));
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");
