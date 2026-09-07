@@ -697,6 +697,11 @@ function App() {
   const [costoNeto, setCostoNeto] = useState(0);
   const [iva, setIva] = useState(0);
   const [costoBruto, setCostoBruto] = useState(0);
+  // "Total Unidades" impreso al pie de la factura (transcrito por el modelo).
+  // Unico control de la cabecera que NO es de plata: una permutacion de
+  // cantidades conserva el neto exacto, pero un duplicado/faltante que el
+  // reparador "cuadro" en plata se delata aca. 0 = la factura no lo declara.
+  const [totalUnidades, setTotalUnidades] = useState(0);
   // El OCR proceso una factura pero NO logro leer el total (tipico: foto que no
   // incluye la parte de abajo, donde estan los totales... y tambien los ultimos
   // productos). En ese caso el cuadre no tiene contra que comparar y se apagaba
@@ -1142,6 +1147,7 @@ function App() {
       setCostoNeto(parsed.costo_neto || 0);
       setIva(parsed.iva || 0);
       setCostoBruto(parsed.costo_bruto || 0);
+      setTotalUnidades(Number(parsed.total_unidades) || 0);
       // Total no leido = señal de foto cortada abajo o de OCR incompleto.
       // Se pide a mano en la tarjeta de cuadre; el envio queda bloqueado hasta ahi.
       setNetoManual(!(Number(parsed.costo_neto) > 0));
@@ -1806,7 +1812,10 @@ function App() {
     setExtractedProducts(prev => {
       const next = [...prev];
       const updated = { ...next[idx], [field]: field === "cantidad" || field === "costo" ? Number(value) || 0 : value };
-      
+      // Editar la cantidad a mano ES la resolucion del candado F (consenso):
+      // el operador miro el papel y decidio. Cualquier valor que escriba vale.
+      if (field === "cantidad" && updated.consenso) updated.consensoResuelto = true;
+
       // If SKU is being edited, try to lookup in dictionary
       if (field === "sku") {
         const skuUp = (value || "").toUpperCase().trim();
@@ -2565,6 +2574,9 @@ function App() {
                 como recepción manual — 22 casos entre feb y jul 2026, ej. folio 535410. */}
             {(() => {
               const sumaLineas = extractedProducts.reduce((s, p) => s + (Number(p.costo) || 0) * (Number(p.cantidad) || 0), 0);
+              const sumaUds = extractedProducts.reduce((s, p) => s + (Number(p.cantidad) || 0), 0);
+              const udsDeclaradas = Number(totalUnidades) || 0;
+              const udsIssue = udsDeclaradas > 0 && sumaUds !== udsDeclaradas;
               const netoCab = Number(costoNeto) || 0;
               // Sin factura (recepción manual RAPIDO/LISTA) no hay nada que cuadrar: el total
               // se muestra en el bloque de envío al WMS. No mostramos esta tarjeta.
@@ -2629,6 +2641,20 @@ function App() {
                         <span>Suma líneas: {fmt(sumaLineas)}</span>
                         <span>{netoManual ? "Neto escrito a mano" : "Neto cabecera"}: {fmt(netoCab)}</span>
                       </div>
+                      {/* Unidades vs "Total Unidades" impreso: el único control de
+                          cabecera que la plata no puede fingir. Advierte (no
+                          bloquea): la protección por línea es el candado F. */}
+                      {udsDeclaradas > 0 && (
+                        <div style={{display: "flex", justifyContent: "space-between", fontSize: 11, color: udsIssue ? "#EF4444" : "#888", fontFamily: "'Courier New', monospace", marginTop: 2}}>
+                          <span>Unidades líneas: {sumaUds}</span>
+                          <span>{udsIssue ? "⚠ " : ""}Total Unidades factura: {udsDeclaradas}</span>
+                        </div>
+                      )}
+                      {udsIssue && (
+                        <div style={{marginTop: 6, fontSize: 11, color: "#EF4444"}}>
+                          La factura declara {udsDeclaradas} unidades y las líneas suman {sumaUds}: hay una cantidad mal leída, una línea de más o una de menos. Cotejá las cantidades contra el papel.
+                        </div>
+                      )}
                       {hasIssue && (
                         <div style={{marginTop: 6, fontSize: 11, color: "#EF4444"}}>
                           {netoManual
@@ -2849,7 +2875,37 @@ function App() {
                       <button style={styles.removeBtn} onClick={() => removeProduct(idx)}>✕</button>
                     </div>
                   </div>
-                  
+
+                  {/* Candado F — consenso: la factura se leyó DOS veces y las
+                      cantidades de esta línea no coinciden (caso 549298:
+                      permutación entre líneas del mismo precio, invisible para
+                      el cuadre). El operador coteja contra el PAPEL y elige;
+                      hasta entonces el envío está bloqueado (locks.js). */}
+                  {p.consenso && !p.consensoResuelto && Number(p.cantidad) > 0 && (
+                    <div style={{margin: "8px 0", padding: "8px 10px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.4)", borderRadius: 8}}>
+                      <div style={{fontSize: 12, color: "#EF4444", fontWeight: 700}}>
+                        ⚠ Leída dos veces con cantidades distintas: {Number(p.cantidad) || 0} y {Number(p.consenso.otra_cantidad) || 0} un.
+                      </div>
+                      <div style={{fontSize: 11, color: "#F59E0B", margin: "4px 0 8px"}}>
+                        Contá esta línea EN LA FACTURA DE PAPEL y tocá la correcta:
+                      </div>
+                      <div style={{display: "flex", gap: 8}}>
+                        {[Number(p.cantidad) || 0, Number(p.consenso.otra_cantidad) || 0].map((cant, ci) => (
+                          <button
+                            key={ci}
+                            style={{flex: 1, padding: "8px 0", borderRadius: 8, border: "1px solid rgba(34,197,94,0.5)", background: "rgba(34,197,94,0.12)", color: "#22C55E", fontWeight: 700, fontSize: 14, cursor: "pointer"}}
+                            onClick={() => {
+                              // updateProduct marca consensoResuelto al tocar "cantidad".
+                              updateProduct(idx, "cantidad", cant);
+                            }}
+                          >
+                            {cant} un. ✓
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Dictionary name (verified) in green, or search interface for unmatched */}
                   {p.etiquetaImpresa === false && p.matched ? (
                     <div style={{marginBottom: 8}}>
@@ -3175,7 +3231,7 @@ function App() {
                 setFolioFactura("");
                 setProveedorFactura("");
                 setWmsStatus(""); setWmsError(""); setWmsErrorEsDup(false);
-                setCostoNeto(0); setIva(0); setCostoBruto(0);
+                setCostoNeto(0); setIva(0); setCostoBruto(0); setTotalUnidades(0);
                 setNetoManual(false);
                 setRefOcOcr(""); setRefOvt(""); setRefFvta("");
                 setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);

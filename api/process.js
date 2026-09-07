@@ -3,7 +3,7 @@ const config = {
 };
 
 // Cuadre puro de la extraccion contra el neto (cuadre.js, testeado en node).
-const { evaluarCuadre, repararCantidades } = require("../cuadre.js");
+const { evaluarCuadre, repararCantidades, compararProductos } = require("../cuadre.js");
 
 // Presupuesto minimo que tiene que quedar para lanzar una SEGUNDA extraccion
 // (120s de timeout de Claude + margen). Si no alcanza, se devuelve la primera
@@ -181,6 +181,8 @@ REGLAS:
 - Costo unitario neto (sin IVA): "P. Unitario", "Precio Unit", "Valor Unit" — número entero sin separador de miles
 - valor_total: el total de ESA línea tal como está impreso ("Valor Total", "Total", "Subtotal" de la fila) — entero sin separador de miles. TRANSCRIBILO, no lo calcules; si la fila no lo trae, 0. Sirve de control: cantidad × costo_unitario debe dar valor_total
 - El OCR suele traer las columnas separadas (primero todos los códigos, después las cantidades sueltas, después precios y totales en pares). Los precios y totales se leen bien; las cantidades de un dígito a veces faltan. Cuando dudes de una cantidad, derivala de valor_total ÷ costo_unitario
+- CUIDADO con la asignación por fila: en estas plantillas el "Valor Total" de una fila suele aparecer en el texto ANTES de su grupo cantidad/descripción/precio, y la cantidad suele venir INMEDIATAMENTE antes de la descripción. Ancla cada cantidad a la descripción que la sigue, no al total más cercano. Un total tomado de la fila vecina con el mismo precio unitario da una cantidad "consistente" pero AJENA — es el error más caro
+- total_unidades: el número que sigue a "Total Unidades" al pie de la tabla — entero, TRANSCRITO. Si no aparece, 0. Control final: la suma de las cantidades debe dar total_unidades
 - Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos). Devuelve como entero: 3400
 - Montos totales al final: Neto, IVA (19%), Total
 - NO inventes productos ni SKUs. Si una línea es ilegible o dudosa NO la omitas en silencio: inclúyela con confianza "baja", con lo que hayas podido leer, y cantidad 0 si la cantidad no se lee. El sistema le mostrará esa línea al operador; una línea omitida desaparece sin que nadie lo note
@@ -193,7 +195,7 @@ REFERENCIAS DE ORDEN DE COMPRA (opcionales, NO afectan la lista de productos):
 
 Responde SOLO JSON válido, COMPACTO: todo en una sola línea, sin saltos de línea,
 sin indentación y sin espacios entre campos. Nada de texto antes ni después del JSON.
-{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"valor_total":0,"confianza":"alta"}]}`;
+{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"total_unidades":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"valor_total":0,"confianza":"alta"}]}`;
 
   // Modelos en orden de preferencia. Si Anthropic retira el primero
   // (404 not_found_error), cae automaticamente al siguiente y la app NO se cae.
@@ -381,39 +383,56 @@ async function handler(req, res) {
         console.log("Cantidades reparadas con valor_total:", JSON.stringify(rep1.detalle));
       }
 
-      // Step 2b: cuadre contra el neto ANTES de devolver. La estructuracion no
-      // es determinista: con el MISMO OCR (factura 548981, 04-sep-2026) una
-      // corrida devolvio las 19 lineas perfectas y otra corrio cantidad/costo
-      // una fila (suma $2.023.000 vs neto $1.869.000). El frontend ya bloquea
-      // el envio cuando no cuadra, pero recien al final y sin decir que linea.
-      // Aca, si no cuadra y queda presupuesto, se pide UNA segunda extraccion
-      // con la pista del descuadre y se devuelve la que cuadre. Si ninguna
-      // cuadra, se devuelve la primera y el frontend la frena como siempre.
-      // Regla 4: el response dice cuantos intentos hubo y como cuadro cada uno.
+      // Step 2b: cuadre contra el neto + SEGUNDA extraccion SIEMPRE (consenso).
+      // La estructuracion no es determinista: con el MISMO OCR una corrida
+      // devuelve las lineas perfectas y otra las corre (548981, 04-sep-2026).
+      // Peor: una PERMUTACION entre lineas del mismo precio unitario conserva
+      // cada Valor Total y el neto exacto — el cuadre es CIEGO a esa clase
+      // (factura 549298, 07-sep-2026: 5 cantidades cruzadas con cuadra=true).
+      // Por eso la segunda extraccion ya no corre solo cuando el cuadre falla:
+      // corre siempre que haya presupuesto, y las lineas donde las dos corridas
+      // NO coinciden se marcan (consenso + confianza baja) para que el operador
+      // las coteje contra el papel — el candado F del frontend bloquea el envio
+      // hasta que las resuelva. Dos corridas independientes no fallan igual dos
+      // veces (medido: tres corridas de la 549298 → tres asignaciones distintas).
+      // Regla 4: el response dice cuantos intentos hubo, como cuadro cada uno y
+      // que decidio el consenso.
       const cuadre1 = evaluarCuadre(parsed);
+      const fallo1 = (cuadre1.evaluable && cuadre1.cuadra === false) || cuadre1.cuadraUnidades === false;
       const extraccion = {
         intentos: 1,
         reparadas_intento1: rep1.reparadas,
         cuadra_intento1: cuadre1.cuadra,
         delta_intento1: cuadre1.evaluable ? cuadre1.delta : null,
+        total_unidades: cuadre1.unidadesDeclaradas,
+        cuadra_unidades_intento1: cuadre1.cuadraUnidades,
         cuadra_final: cuadre1.cuadra,
         reintento_omitido: null,
+        consenso: null,
       };
-      if (cuadre1.evaluable && cuadre1.cuadra === false) {
+      {
         const restante = finPresupuesto - Date.now();
         if (restante < MIN_MS_PARA_REINTENTO) {
           extraccion.reintento_omitido = "sin_presupuesto";
-          console.log("Cuadre falló (delta " + cuadre1.delta + ") y no queda presupuesto para reintentar");
+          extraccion.consenso = { corrido: false, motivo: "sin_presupuesto" };
+          console.log("Sin presupuesto para la segunda extracción (consenso)" +
+            (fallo1 ? " — el cuadre falló (delta " + cuadre1.delta + ") y el frontend la frena" : ""));
         } else {
-          console.log("Cuadre falló (suma " + cuadre1.suma + " vs neto " + cuadre1.neto + ", " + cuadre1.unidades + " uds): reintentando la extracción");
-          const pista =
-            "VERIFICACIÓN: en un intento anterior la suma de cantidad × costo_unitario dio " + cuadre1.suma +
-            " pero el NETO de la factura es " + cuadre1.neto + " (diferencia " + cuadre1.delta + "). " +
-            "Casi siempre es porque la cantidad o el precio de una fila se tomó de la fila vecina: el OCR trae " +
-            "las columnas separadas y cada número pertenece a UNA sola fila, en orden. Reasigná fila por fila " +
-            "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control — transcribí ese " +
-            "valor_total y derivá la cantidad como valor_total ÷ costo_unitario —, y comprobá que la suma de " +
-            "todas las líneas sea exactamente el neto antes de responder.";
+          const pista = fallo1
+            ? "VERIFICACIÓN: en un intento anterior la suma de cantidad × costo_unitario dio " + cuadre1.suma +
+              " pero el NETO de la factura es " + cuadre1.neto + " (diferencia " + cuadre1.delta + ")" +
+              (cuadre1.cuadraUnidades === false
+                ? ", y la suma de cantidades dio " + cuadre1.unidades + " contra " + cuadre1.unidadesDeclaradas + " unidades declaradas"
+                : "") + ". " +
+              "Casi siempre es porque la cantidad o el precio de una fila se tomó de la fila vecina: el OCR trae " +
+              "las columnas separadas y cada número pertenece a UNA sola fila, en orden. Reasigná fila por fila " +
+              "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control — transcribí ese " +
+              "valor_total y derivá la cantidad como valor_total ÷ costo_unitario —, y comprobá que la suma de " +
+              "todas las líneas sea exactamente el neto antes de responder."
+            : ""; // sin pista: corrida INDEPENDIENTE, para que el consenso valga como segunda opinion
+          console.log(fallo1
+            ? "Cuadre falló (suma " + cuadre1.suma + " vs neto " + cuadre1.neto + ", " + cuadre1.unidades + " uds): reintentando la extracción"
+            : "Cuadre OK: segunda extracción independiente para consenso");
           let parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista);
           const rep2 = repararCantidades(parsed2);
           if (rep2.reparadas > 0) {
@@ -425,13 +444,55 @@ async function handler(req, res) {
           extraccion.reparadas_intento2 = rep2.reparadas;
           extraccion.cuadra_intento2 = cuadre2.cuadra;
           extraccion.delta_intento2 = cuadre2.evaluable ? cuadre2.delta : null;
-          if (cuadre2.cuadra === true) {
+          extraccion.cuadra_unidades_intento2 = cuadre2.cuadraUnidades;
+
+          // Eleccion del resultado final (misma regla de siempre): si el primero
+          // fallo y el segundo cuadra, gana el segundo; si no, se queda el primero.
+          let otro = parsed2;
+          if (fallo1 && cuadre2.cuadra === true && cuadre2.cuadraUnidades !== false) {
+            otro = parsed;
             parsed = parsed2;
             extraccion.cuadra_final = true;
             console.log("Reintento cuadró: se usa la segunda extracción (" + (parsed2.productos?.length || 0) + " products)");
-          } else {
+          } else if (fallo1) {
             extraccion.cuadra_final = false;
             console.log("Reintento tampoco cuadró (delta " + cuadre2.delta + "): se devuelve la primera, el frontend la frena");
+          }
+
+          // Consenso: solo cuando la plata NO puede arbitrar — las dos corridas
+          // cuadran (o el neto no es evaluable en ambas). Si una cuadra y la
+          // otra no, el cuadre ya eligio y marcar las diferencias contra una
+          // corrida sabidamente rota seria puro ruido.
+          const cuadreFinal = evaluarCuadre(parsed);
+          const cuadreOtro = evaluarCuadre(otro);
+          const arbitrable = cuadreFinal.cuadra !== false && cuadreOtro.cuadra !== false &&
+            cuadreFinal.cuadra === cuadreOtro.cuadra;
+          const comp = compararProductos(parsed, otro);
+          if (arbitrable && comp.evaluable) {
+            const marcados = [];
+            const porSku = {};
+            comp.discrepancias.forEach(function (d) { porSku[d.sku] = d; });
+            parsed.productos.forEach(function (p) {
+              const sku = (p && p.sku ? String(p.sku) : "").toUpperCase().trim();
+              const d = porSku[sku];
+              if (!d) return;
+              p.consenso = { otra_cantidad: d.cantidadB, otra_costo: d.costoB };
+              p.confianza = "baja";
+              marcados.push(sku);
+            });
+            extraccion.consenso = {
+              corrido: true,
+              coinciden: comp.coinciden,
+              discrepancias: marcados,
+              solo_final: comp.soloA,
+              solo_otra: comp.soloB,
+              duplicados_final: comp.duplicadosA,
+            };
+            if (marcados.length > 0) {
+              console.log("Consenso: " + marcados.length + " linea(s) con cantidades distintas entre corridas:", JSON.stringify(marcados));
+            }
+          } else {
+            extraccion.consenso = { corrido: true, arbitrado_por_cuadre: true };
           }
         }
       }

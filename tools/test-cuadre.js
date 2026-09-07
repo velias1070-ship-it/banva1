@@ -56,6 +56,31 @@ console.log("evaluarCuadre");
   const r = evaluarCuadre(null);
   check("input nulo no revienta", r.evaluable === false && r.suma === 0);
 }
+{
+  // Factura 549298: imprime "Total Unidades: 424" y Vision lo lee. Es el unico
+  // control que NO es de plata: atrapa reparaciones que inventan unidades.
+  const p = Object.assign({ total_unidades: 125 }, OK_548981);
+  const r = evaluarCuadre(p);
+  check("total_unidades declarado y correcto: cuadraUnidades=true",
+    r.unidadesDeclaradas === 125 && r.cuadraUnidades === true, JSON.stringify(r));
+}
+{
+  const p = Object.assign({ total_unidades: 127 }, OK_548981);
+  const r = evaluarCuadre(p);
+  check("total_unidades declarado y distinto: cuadraUnidades=false aunque la plata cuadre",
+    r.cuadra === true && r.cuadraUnidades === false, JSON.stringify(r));
+}
+{
+  const r = evaluarCuadre(OK_548981);
+  check("sin total_unidades: cuadraUnidades=null, no false (Regla 1)",
+    r.unidadesDeclaradas === null && r.cuadraUnidades === null, JSON.stringify(r));
+}
+{
+  const p = Object.assign({ total_unidades: "125" }, OK_548981);
+  const r = evaluarCuadre(p);
+  check("total_unidades como string (JSON del modelo) se tolera",
+    r.unidadesDeclaradas === 125 && r.cuadraUnidades === true);
+}
 
 console.log("\nrepararCantidades");
 {
