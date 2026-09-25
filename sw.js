@@ -1,5 +1,5 @@
-const CACHE_NAME = 'banva-etiquetas-v3';
-const ASSETS = ['/', '/index.html', '/locks.js', '/manifest.json'];
+const CACHE_NAME = 'banva-etiquetas-v4';
+const ASSETS = ['/', '/index.html', '/locks.js', '/cuadre.js', '/manifest.json'];
 
 self.addEventListener('install', (e) => {
   // addAll es atomico: un solo asset caido (deploy a medias) rechazaria el

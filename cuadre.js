@@ -18,7 +18,45 @@
 
   function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
-  // Devuelve { evaluable, cuadra, suma, neto, unidades, delta,
+  // ---- Descuento al pie de la factura (Chantilly, folio 266248, 24-sep-2026) ----
+  // Algunos proveedores imprimen las lineas a PRECIO DE LISTA y restan un
+  // descuento global al pie ("Descuento 137,656" → "Monto Neto 1,238,904").
+  // Sin esto la suma de lineas nunca da el neto y la factura quedaba bloqueada
+  // aunque se hubiera leido perfecta.
+  //
+  // Tres reglas para que el descuento NO pueda tapar una lectura mala:
+  // 1. descuentoAlPieRespaldado: el monto tiene que estar IMPRESO — el texto
+  //    OCR trae la palabra "Descuento" (no "Desc." de columna) y un numero cuyo
+  //    valor es exactamente ese monto. Si no, vale 0. Nunca se deduce.
+  // 2. descuentoAplicable: el descuento solo se usa si la factura NO cuadra
+  //    directo y SI cuadra restandolo (dentro de la tolerancia). Una factura
+  //    que hoy cuadra sigue cuadrando igual: el descuento no cambia nada ahi.
+  // 3. El resto de los controles (unidades, consenso, candados) no se toca.
+  // Medido en prod 25-sep-2026 sobre recepciones created_by='App Etiquetas'
+  // con factura_original.ocr_text (69, desde 12-ago-2026): 0 traen la palabra
+  // "descuento" (control positivo: 65 traen "descripci"). Ninguna factura
+  // escaneada hasta hoy tenia descuento al pie.
+  function descuentoAlPieRespaldado(ocrText, monto) {
+    const m = num(monto);
+    if (!(m > 0) || !ocrText) return false;
+    const texto = String(ocrText);
+    if (!/(^|[^a-z])descuento([^a-z]|$)/i.test(texto)) return false;
+    const numeros = texto.match(/\d{1,3}(?:[.,]\d{3})+|\d+/g) || [];
+    return numeros.some(function (t) { return Number(t.replace(/[.,]/g, "")) === m; });
+  }
+
+  // Devuelve el descuento que corresponde restar (o 0). `tolerancia` en pesos:
+  // 0 en el servidor (cuadre al peso), 100 en el frontend (su regla de siempre).
+  function descuentoAplicable(suma, neto, descuento, tolerancia) {
+    const d = num(descuento);
+    const tol = num(tolerancia);
+    if (!(d > 0) || !(num(neto) > 0)) return 0;
+    if (Math.abs(num(suma) - num(neto)) <= tol) return 0; // cuadra directo
+    return Math.abs(num(suma) - d - num(neto)) <= tol ? d : 0;
+  }
+
+  // Devuelve { evaluable, cuadra, suma, neto, descuento, unidades, delta,
+  //            (delta = suma - descuento - neto; descuento = 0 si no aplica)
   //            unidadesDeclaradas, cuadraUnidades }.
   // - evaluable=false cuando no hay neto (>0) o no hay productos: no se puede
   //   afirmar nada, y NO se reintenta a ciegas (Regla 1: null no es "no cuadra").
@@ -40,13 +78,17 @@
     });
     const evaluable = neto > 0 && productos.length > 0;
     const unidadesDeclaradas = declaradas > 0 ? declaradas : null;
+    // descuento_pie ya viene validado contra el OCR (descuentoAlPieRespaldado,
+    // en api/process.js); aca solo se decide si corresponde restarlo.
+    const descuento = descuentoAplicable(suma, neto, parsed && parsed.descuento_pie, 0);
     return {
       evaluable: evaluable,
-      cuadra: evaluable ? suma === neto : null,
+      cuadra: evaluable ? suma - descuento === neto : null,
       suma: suma,
       neto: neto,
+      descuento: descuento,
       unidades: unidades,
-      delta: suma - neto,
+      delta: suma - descuento - neto,
       unidadesDeclaradas: unidadesDeclaradas,
       cuadraUnidades: unidadesDeclaradas !== null && productos.length > 0
         ? unidades === unidadesDeclaradas
@@ -220,5 +262,5 @@
     return out;
   }
 
-  return { evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
+  return { descuentoAlPieRespaldado: descuentoAlPieRespaldado, descuentoAplicable: descuentoAplicable, evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
 });

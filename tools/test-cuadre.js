@@ -3,7 +3,7 @@
 "use strict";
 
 const path = require("path");
-const { evaluarCuadre, repararCantidades } = require(path.join(__dirname, "..", "cuadre.js"));
+const { evaluarCuadre, repararCantidades, descuentoAlPieRespaldado, descuentoAplicable } = require(path.join(__dirname, "..", "cuadre.js"));
 
 let fallas = 0;
 function check(nombre, cond, detalle) {
@@ -138,6 +138,79 @@ console.log("\nrepararCantidades");
   const r = repararCantidades(p);
   const c = evaluarCuadre(r.parsed);
   check("548981 con cantidades en 0 se reconstruye entera desde los totales", r.reparadas === 19 && c.cuadra === true && c.unidades === 125, JSON.stringify(c));
+}
+
+// ---- Descuento al pie ----
+// Forma de la factura Chantilly 266248 (24-sep-2026): lineas a precio de lista,
+// "Descuento" global al pie y "Monto Neto" ya descontado. Los montos de aca son
+// SINTETICOS (el repo es publico): misma estructura, 10 % al pie.
+// Lineas: 10 x 10.000 + 20 x 5.000 + 48 x 2.000 = 296.000; descuento 29.600; neto 266.400.
+const CHANTILLY_FORMA = {
+  costo_neto: 266400,
+  descuento_pie: 29600,
+  productos: [
+    { sku: "111111111111", cantidad: 10, costo_unitario: 10000 },
+    { sku: "222222222222", cantidad: 20, costo_unitario: 5000 },
+    { sku: "333333333333", cantidad: 48, costo_unitario: 2000 },
+  ],
+};
+// Fragmento del texto OCR con la MISMA disposicion que devolvio Vision para la
+// 266248 (columna "Total Desc." en el encabezado, "Descuento" y su monto en
+// lineas separadas, totales despues).
+const OCR_FORMA = [
+  "Cantidad", "Unidad", "Descripción", "P.Unit", "Total Desc.", "Valor Total",
+  "10.00", "UNI", "111111111111 PRODUCTO A", "10,000", "100,000",
+  "Descuento", "29,600",
+  "Monto Neto", "IVA (19%)", "Total", "266,400", "50,616", "317,016",
+].join("\n");
+
+console.log("descuento al pie");
+{
+  const r = evaluarCuadre(CHANTILLY_FORMA);
+  check("lineas a lista + descuento al pie: cuadra restando el descuento", r.cuadra === true && r.descuento === 29600 && r.delta === 0, JSON.stringify(r));
+}
+{
+  const p = Object.assign({}, CHANTILLY_FORMA, { descuento_pie: 0 });
+  const r = evaluarCuadre(p);
+  check("la misma factura sin descuento leido: NO cuadra (comportamiento de antes)", r.cuadra === false && r.descuento === 0 && r.delta === 29600, JSON.stringify(r));
+}
+{
+  // Factura que HOY cuadra directo + un descuento_pie espurio: no cambia nada.
+  const p = Object.assign({}, OK_548981, { descuento_pie: 5000 });
+  const r = evaluarCuadre(p);
+  check("factura que cuadra directo: el descuento se ignora (descuento 0)", r.cuadra === true && r.descuento === 0 && r.delta === 0, JSON.stringify(r));
+}
+{
+  // Linea mal leida + descuento que NO explica la diferencia: sigue sin cuadrar.
+  const p = JSON.parse(JSON.stringify(CHANTILLY_FORMA));
+  p.productos[1].cantidad = 21;
+  const r = evaluarCuadre(p);
+  check("linea mal leida con descuento: el descuento NO la tapa", r.cuadra === false && r.descuento === 0, JSON.stringify(r));
+}
+{
+  const p = Object.assign({}, CHANTILLY_FORMA, { descuento_pie: "29600" });
+  check("descuento como string numerico se acepta", evaluarCuadre(p).cuadra === true);
+  const q = Object.assign({}, CHANTILLY_FORMA, { descuento_pie: -29600 });
+  check("descuento negativo no aplica", evaluarCuadre(q).cuadra === false);
+}
+{
+  check("respaldado: monto impreso junto a 'Descuento'", descuentoAlPieRespaldado(OCR_FORMA, 29600) === true);
+  check("no respaldado: monto que no esta impreso", descuentoAlPieRespaldado(OCR_FORMA, 29601) === false);
+  check("no respaldado: sin la palabra 'Descuento' (solo la columna 'Total Desc.')",
+    descuentoAlPieRespaldado(OCR_FORMA.replace("Descuento\n", ""), 29600) === false);
+  check("no respaldado: monto 0 o texto vacio", descuentoAlPieRespaldado(OCR_FORMA, 0) === false && descuentoAlPieRespaldado("", 29600) === false);
+  check("respaldado con punto de miles (29.600)", descuentoAlPieRespaldado(OCR_FORMA.replace("29,600", "29.600"), 29600) === true);
+  check("no confunde 'Descuentos varios' pegado a otra palabra", descuentoAlPieRespaldado("Sindescuento\n29,600", 29600) === false);
+}
+{
+  // Tolerancia del frontend (100): misma regla que su cuadre de siempre.
+  check("frontend: aplica dentro de ±100", descuentoAplicable(296050, 266400, 29600, 100) === 29600);
+  check("frontend: no aplica si cuadra directo", descuentoAplicable(266450, 266400, 29600, 100) === 0);
+  // Descuento chico (<= tolerancia): una factura que YA cuadra directo no cambia
+  // su neto mostrado (sin la regla "cuadra directo → 0" esto devolvia 50).
+  check("frontend: cuadra directo con descuento chico → 0", descuentoAplicable(266450, 266400, 50, 100) === 0);
+  check("frontend: no aplica fuera de tolerancia", descuentoAplicable(296500, 266400, 29600, 100) === 0);
+  check("frontend: sin neto no aplica", descuentoAplicable(296000, 0, 29600, 100) === 0);
 }
 
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");
