@@ -26,6 +26,7 @@
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script src="locks.js"></script>
+<script src="cuadre.js"></script>
 
 <script type="text/babel">
 const { useState, useRef, useCallback, useEffect } = React;
@@ -145,7 +146,11 @@ async function resolveProveedor(proveedor, rut) {
     clearTimeout(timeoutId);
     if (!resp.ok) throw new Error("status " + resp.status);
     const data = await resp.json();
-    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null, fuente: "resolve" };
+    // descuento_comercial_pct: campo agregado al endpoint el 25-sep-2026. Un
+    // banvabodega que no lo mande deja null → el descuento al pie no aplica.
+    const pct = Number(data.descuento_comercial_pct);
+    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null, fuente: "resolve",
+      descuento_comercial_pct: Number.isFinite(pct) ? pct : null };
   } catch (e) {
     console.warn("[resolveProveedor] fallback con razon_social cruda:", e?.message || e);
     return { nombre_canonico: proveedor, proveedor_id: null, fuente: "fallback" };
@@ -258,7 +263,13 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
     costo_neto: costos?.costo_neto || 0,
     iva: costos?.iva || 0,
     costo_bruto: costos?.costo_bruto || 0,
-    notas: "",
+    // Descuento al pie (cuadre.js): las lineas viajan a precio de lista y el
+    // neto de cabecera ya viene descontado. banvabodega lleva cada linea al
+    // precio real con el trigger de su migracion 0318 (proveedores con
+    // descuento_comercial_pct). La nota deja el porque a la vista del admin.
+    notas: costos?.descuento_pie > 0
+      ? "Descuento al pie de factura: $" + Math.round(costos.descuento_pie).toLocaleString("es-CL") + " (líneas a precio de lista)"
+      : "",
     created_by: "App Etiquetas",
     // Vínculo con OC + referencias crudas. Van SIEMPRE (null si no aplica).
     orden_compra_id: nz(oc.orden_compra_id),
@@ -285,6 +296,7 @@ async function sendRecepcionToWMS(folio, proveedor, imagenBase64, productos, cos
       // Si el envio salio con override de candados, queda el motivo y que
       // bloqueos se saltaron: el incidente no puede repetirse EN SILENCIO.
       override: forense.override || null,
+      descuento_pie: costos?.descuento_pie || 0,
     } : null,
   };
 
@@ -702,6 +714,23 @@ function App() {
   // cantidades conserva el neto exacto, pero un duplicado/faltante que el
   // reparador "cuadro" en plata se delata aca. 0 = la factura no lo declara.
   const [totalUnidades, setTotalUnidades] = useState(0);
+  // Descuento global impreso al pie ("Descuento 137,656"), ya validado contra
+  // el OCR en api/process.js. Solo se resta si la factura NO cuadra directo y
+  // SI cuadra restandolo (cuadre.js, descuentoAplicable). 0 = no hay.
+  const [descuentoPie, setDescuentoPie] = useState(0);
+  // % de descuento comercial del proveedor en banvabodega (lo trae el resolve
+  // del panel de OC). null = no se pudo saber → el descuento NO se aplica.
+  const [proveedorDescPct, setProveedorDescPct] = useState(null);
+  // Sin cuadre.js cargado, sin % del proveedor, o con un monto que no es ese %
+  // de la suma, devuelve 0: se comporta como antes (falla cerrada).
+  const descuentoQueCuadra = (sumaLineas) => {
+    const C = window.BanvaCuadre;
+    if (!C) return 0;
+    const d = C.descuentoAplicable(sumaLineas, Number(costoNeto) || 0, descuentoPie, 100);
+    if (!(d > 0)) return 0;
+    const nLineas = extractedProducts.filter(p => Number(p.cantidad) > 0).length;
+    return C.descuentoCalzaConPct(sumaLineas, d, proveedorDescPct, nLineas) ? d : 0;
+  };
   // El OCR proceso una factura pero NO logro leer el total (tipico: foto que no
   // incluye la parte de abajo, donde estan los totales... y tambien los ultimos
   // productos). En ese caso el cuadre no tiene contra que comparar y se apagaba
@@ -1148,6 +1177,7 @@ function App() {
       setIva(parsed.iva || 0);
       setCostoBruto(parsed.costo_bruto || 0);
       setTotalUnidades(Number(parsed.total_unidades) || 0);
+      setDescuentoPie(Number(parsed.descuento_pie) || 0);
       // Total no leido = señal de foto cortada abajo o de OCR incompleto.
       // Se pide a mano en la tarjeta de cuadre; el envio queda bloqueado hasta ahi.
       setNetoManual(!(Number(parsed.costo_neto) > 0));
@@ -1160,7 +1190,7 @@ function App() {
       // Reset del panel de vínculo: cada factura arranca sin decisión (el efecto
       // de "review" lo recalcula). Evita arrastrar la OC de la factura anterior.
       setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);
-      setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota("");
+      setOcValidResult(null); setOcSeleccion(null); setSinOcMotivo(""); setOcNota(""); setProveedorDescPct(null);
       setProcessingStatus("Cruzando con diccionario de códigos ML...");
       
       // Cross-reference with dictionary - exact + OCR fuzzy match (I↔1, O↔0, etc.)
@@ -1339,7 +1369,8 @@ function App() {
       setWmsStatus("error");
       return;
     }
-    const diffNeto = sumaLineas - netoCab;
+    const descuento = descuentoQueCuadra(sumaLineas);
+    const diffNeto = sumaLineas - descuento - netoCab;
     if (netoCab > 0 && Math.abs(diffNeto) > 100) {
       const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
       setWmsError(`Las líneas suman ${fmt(sumaLineas)} pero el neto de la factura dice ${fmt(netoCab)} (diferencia ${diffNeto >= 0 ? "+" : ""}${fmt(diffNeto)}). Revisá los costos de las líneas antes de enviar.`);
@@ -1404,6 +1435,7 @@ function App() {
         const brutoFinal = Number(costoBruto) > 0 ? Number(costoBruto) : netoCab + ivaLeido;
         costos = { costo_neto: netoCab, iva: ivaLeido, costo_bruto: brutoFinal };
       }
+      if (conFactura && descuento > 0) costos.descuento_pie = descuento;
       // Decisión de vínculo tomada en el panel → objeto que el INSERT escribe tal cual.
       // Prioridad: OC seleccionada > motivo sin-OC > conflicto determinista sin resolver > cola.
       const conflictoPend = !ocSeleccion && !sinOcMotivo &&
@@ -1434,7 +1466,7 @@ function App() {
       setWmsErrorEsDup(!!err.esDupFvta);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo, skusCatalogo, candadosOverride]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, descuentoPie, proveedorDescPct, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo, skusCatalogo, candadosOverride]);
 
   // ---- Último costo conocido por SKU (de la última recepción) ----
   // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
@@ -1476,7 +1508,7 @@ function App() {
   const cargarVinculoOC = useCallback(async () => {
     const sb = getWMSClient();
     if (!sb) { setOcStatus("na"); return; }
-    setOcStatus("loading"); setOcNota("");
+    setOcStatus("loading"); setOcNota(""); setProveedorDescPct(null);
     // Cada carga arranca limpia (también al "recalcular" a mano). Las refs crudas
     // (ref_oc_ocr/ovt/fvta) NO se tocan acá: son datos de OCR, no decisión.
     setOcSeleccion(null); setSinOcMotivo(""); setOcValidResult(null); setOcCandidatas([]);
@@ -1491,6 +1523,7 @@ function App() {
     try {
       const r = await resolveProveedor(proveedorFactura, null);
       proveedor_id = r?.proveedor_id || null;
+      setProveedorDescPct(r?.descuento_comercial_pct ?? null);
     } catch (_) { proveedor_id = null; }
     setOcProveedorId(proveedor_id);
 
@@ -2582,7 +2615,8 @@ function App() {
               // se muestra en el bloque de envío al WMS. No mostramos esta tarjeta.
               if (netoCab <= 0 && !netoManual) return null;
               const sinNeto = netoManual && netoCab <= 0;
-              const diff = sumaLineas - netoCab;
+              const descuento = descuentoQueCuadra(sumaLineas);
+              const diff = sumaLineas - descuento - netoCab;
               const fmt = (n) => "$" + Math.round(n).toLocaleString("es-CL");
               const hasIssue = !sinNeto && Math.abs(diff) > 100;
               const hasMinor = !sinNeto && Math.abs(diff) > 0 && Math.abs(diff) <= 100;
@@ -2641,6 +2675,21 @@ function App() {
                         <span>Suma líneas: {fmt(sumaLineas)}</span>
                         <span>{netoManual ? "Neto escrito a mano" : "Neto cabecera"}: {fmt(netoCab)}</span>
                       </div>
+                      {descuento > 0 && (
+                        <div style={{fontSize: 11, color: "#888", fontFamily: "'Courier New', monospace", marginTop: 2}}>
+                          − Descuento al pie de la factura: {fmt(descuento)} → {fmt(sumaLineas - descuento)} (las líneas van a precio de lista)
+                        </div>
+                      )}
+                      {hasIssue && descuento === 0 && Number(descuentoPie) > 0 && (
+                        <div style={{marginTop: 6, fontSize: 11, color: "#F59E0B"}}>
+                          La factura trae un descuento al pie de {fmt(Number(descuentoPie))}, pero no se aplicó:
+                          {proveedorDescPct === null || proveedorDescPct === undefined
+                            ? " todavía no se pudo confirmar el descuento comercial del proveedor en banvabodega (cargando o sin respuesta). Esperá unos segundos o recalculá."
+                            : !(Number(proveedorDescPct) > 0)
+                            ? " el proveedor no tiene descuento comercial cargado en banvabodega (Admin → Compras → Proveedores)."
+                            : " no es el " + proveedorDescPct + "% de la suma de líneas, o no explica la diferencia. Revisá las cantidades y precios contra el papel."}
+                        </div>
+                      )}
                       {/* Unidades vs "Total Unidades" impreso: el único control de
                           cabecera que la plata no puede fingir. Advierte (no
                           bloquea): la protección por línea es el candado F. */}
@@ -3065,7 +3114,8 @@ function App() {
                   const totalUds = extractedProducts.reduce((s, p) => s + (Number(p.cantidad) || 0), 0);
                   const netoCab = Number(costoNeto) || 0;
                   const sinCostos = sumaLineas <= 0;
-                  const desfase = netoCab > 0 && Math.abs(sumaLineas - netoCab) > 100;
+                  const descuento = descuentoQueCuadra(sumaLineas);
+                  const desfase = netoCab > 0 && Math.abs(sumaLineas - descuento - netoCab) > 100;
                   // Misma regla que el guard de sendToWMS: con factura, el neto es
                   // obligatorio (es lo único que detecta productos faltantes).
                   const esFlujoManual = folioFactura === "RAPIDO" || folioFactura === "LISTA";
@@ -3079,7 +3129,7 @@ function App() {
                     <>
                       <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", marginBottom: 8, background: "#141416", borderRadius: 10, border: "1px solid #2A2A30", fontSize: 13}}>
                         <span style={{color: "#888"}}>Total recepción (neto) · {totalUds} uds</span>
-                        <span style={{color: sinCostos ? "#666" : "#22C55E", fontWeight: 700}}>{sinCostos ? "— cargá costos" : fmt(sumaLineas)}</span>
+                        <span style={{color: sinCostos ? "#666" : "#22C55E", fontWeight: 700}}>{sinCostos ? "— cargá costos" : fmt(sumaLineas - descuento)}</span>
                       </div>
                       <button
                         onClick={sendToWMS}
@@ -3231,7 +3281,7 @@ function App() {
                 setFolioFactura("");
                 setProveedorFactura("");
                 setWmsStatus(""); setWmsError(""); setWmsErrorEsDup(false);
-                setCostoNeto(0); setIva(0); setCostoBruto(0); setTotalUnidades(0);
+                setCostoNeto(0); setIva(0); setCostoBruto(0); setTotalUnidades(0); setDescuentoPie(0); setProveedorDescPct(null);
                 setNetoManual(false);
                 setRefOcOcr(""); setRefOvt(""); setRefFvta("");
                 setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);

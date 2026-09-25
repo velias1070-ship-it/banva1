@@ -18,7 +18,105 @@
 
   function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
-  // Devuelve { evaluable, cuadra, suma, neto, unidades, delta,
+  // ---- Descuento al pie de la factura (Chantilly, folio 266248, 24-sep-2026) ----
+  // Algunos proveedores imprimen las lineas a PRECIO DE LISTA y restan un
+  // descuento global al pie ("Descuento 137,656" → "Monto Neto 1,238,904").
+  // Sin esto la suma de lineas nunca da el neto y la factura quedaba bloqueada
+  // aunque se hubiera leido perfecta.
+  //
+  // Tres reglas para que el descuento NO pueda tapar una lectura mala:
+  // 1. descuentoAlPieRespaldado: el monto tiene que estar IMPRESO JUNTO a la
+  //    palabra "Descuento" (no "Desc." de columna): en la misma linea o en las
+  //    2 siguientes del texto OCR, sin contar porcentajes ("10%"). Si no, vale
+  //    0. Nunca se deduce. (Revision del PR: aceptar CUALQUIER numero del texto
+  //    dejaba que un precio unitario tapara una cantidad sobreleida.)
+  // 2. descuentoAplicable: el descuento solo se usa si la factura NO cuadra
+  //    directo y SI cuadra restandolo (dentro de la tolerancia). Una factura
+  //    que hoy cuadra sigue cuadrando igual: el descuento no cambia nada ahi.
+  // 3. descuentoCalzaConPct (sólo frontend, que conoce al proveedor): el
+  //    proveedor tiene que tener descuento_comercial_pct en banvabodega y el
+  //    monto tiene que ser ese % de la suma de lineas. Con eso una linea mal
+  //    leida no puede cuadrar: cambia la suma, cambia el % esperado, y el
+  //    descuento impreso deja de calzar. Tambien asegura que el trigger 0318
+  //    de banvabodega lleve cada linea a su precio real (sin % no lo haria).
+  // 4. El resto de los controles (unidades, consenso, candados) no se toca.
+  // Medido en prod 25-sep-2026 sobre recepciones created_by='App Etiquetas'
+  // con factura_original.ocr_text (69, desde 12-ago-2026): 0 traen la palabra
+  // "descuento" (control positivo: 65 traen "descripci"). Ninguna factura
+  // escaneada hasta hoy tenia descuento al pie.
+  function descuentoAlPieRespaldado(ocrText, monto) {
+    const m = num(monto);
+    if (!(m > 0) || !ocrText) return false;
+    const lineas = String(ocrText).split(/\n/);
+    const palabra = /(^|[^a-z])descuento([^a-z]|$)/i;
+    // Numero con separador de miles chileno o ingles; el lookahead descarta
+    // porcentajes ("10%", "10 %"). Decimales ",00" no cuentan como miles.
+    const reNum = /\d{1,3}(?:[.,]\d{3})+(?![\d%])(?!\s*%)|\d+(?![\d%.,])(?!\s*%)/g;
+    for (let i = 0; i < lineas.length; i++) {
+      const hit = palabra.exec(lineas[i]);
+      if (!hit) continue;
+      const resto = lineas[i].slice(hit.index + hit[0].length);
+      // Modo columna: «Descuento» solo en su linea y seguido de otro rotulo.
+      // Ahi la ventana de 2 lineas no sirve (tomaria el monto de otro rotulo)
+      // y manda el emparejamiento por posicion de mas abajo.
+      const modoColumna = sinNumero(resto) && i + 1 < lineas.length &&
+        lineas[i + 1].trim() !== "" && sinNumero(lineas[i + 1]);
+      const ventana = modoColumna ? "" : [resto]
+        .concat(lineas.slice(i + 1, i + 3)).join("\n");
+      const numeros = ventana.match(reNum) || [];
+      if (numeros.some(function (t) { return Number(t.replace(/[.,]/g, "")) === m; })) return true;
+      // Rotulos en columna: Vision a veces lista todos los rotulos del pie y
+      // DESPUES todos los montos ("Descuento / Monto Neto / IVA (19%) / Total /
+      // 21,552 / 193,968 / ..."; factura 266247, 25-sep-2026). Ahi el monto del
+      // descuento es el que ocupa, en el bloque de montos, la MISMA posicion que
+      // «Descuento» en el bloque de rotulos. Rotulo = linea sin ningun numero
+      // (un porcentaje no cuenta); monto = linea que es solo un numero.
+      if (!modoColumna) continue;
+      let ini = i;
+      while (ini > 0 && sinNumero(lineas[ini - 1]) && lineas[ini - 1].trim()) ini--;
+      let fin = i + 1;
+      while (fin < lineas.length && sinNumero(lineas[fin])) fin++;
+      const k = i - ini;
+      let n = 0;
+      for (let j = fin; j < lineas.length; j++) {
+        const v = soloMonto(lineas[j]);
+        if (v === null) break;
+        if (n === k) { if (v === m) return true; break; }
+        n++;
+      }
+    }
+    return false;
+
+    function sinNumero(l) { reNum.lastIndex = 0; return !reNum.test(l); }
+    function soloMonto(l) {
+      const t = String(l).trim().replace(/^\$\s*/, "");
+      return /^(\d{1,3}(?:[.,]\d{3})+|\d+)$/.test(t) ? Number(t.replace(/[.,]/g, "")) : null;
+    }
+  }
+
+  // El descuento tiene que ser el % comercial del proveedor sobre la suma de
+  // lineas a lista. Tolerancia: 1 peso por linea (el proveedor puede redondear
+  // el descuento linea a linea). pct null/0 = proveedor sin descuento → false.
+  function descuentoCalzaConPct(suma, descuento, pct, nLineas) {
+    const d = num(descuento);
+    const p = num(pct);
+    if (!(d > 0) || !(p > 0) || !(num(suma) > 0)) return false;
+    const esperado = num(suma) * p / 100;
+    return Math.abs(d - esperado) <= Math.max(1, num(nLineas));
+  }
+
+  // Devuelve el descuento que corresponde restar (o 0). `tolerancia` en pesos:
+  // 0 en el servidor (cuadre al peso), 100 en el frontend (su regla de siempre).
+  function descuentoAplicable(suma, neto, descuento, tolerancia) {
+    const d = num(descuento);
+    const tol = num(tolerancia);
+    if (!(d > 0) || !(num(neto) > 0)) return 0;
+    if (Math.abs(num(suma) - num(neto)) <= tol) return 0; // cuadra directo
+    return Math.abs(num(suma) - d - num(neto)) <= tol ? d : 0;
+  }
+
+  // Devuelve { evaluable, cuadra, suma, neto, descuento, unidades, delta,
+  //            (delta = suma - descuento - neto; descuento = 0 si no aplica)
   //            unidadesDeclaradas, cuadraUnidades }.
   // - evaluable=false cuando no hay neto (>0) o no hay productos: no se puede
   //   afirmar nada, y NO se reintenta a ciegas (Regla 1: null no es "no cuadra").
@@ -40,13 +138,17 @@
     });
     const evaluable = neto > 0 && productos.length > 0;
     const unidadesDeclaradas = declaradas > 0 ? declaradas : null;
+    // descuento_pie ya viene validado contra el OCR (descuentoAlPieRespaldado,
+    // en api/process.js); aca solo se decide si corresponde restarlo.
+    const descuento = descuentoAplicable(suma, neto, parsed && parsed.descuento_pie, 0);
     return {
       evaluable: evaluable,
-      cuadra: evaluable ? suma === neto : null,
+      cuadra: evaluable ? suma - descuento === neto : null,
       suma: suma,
       neto: neto,
+      descuento: descuento,
       unidades: unidades,
-      delta: suma - neto,
+      delta: suma - descuento - neto,
       unidadesDeclaradas: unidadesDeclaradas,
       cuadraUnidades: unidadesDeclaradas !== null && productos.length > 0
         ? unidades === unidadesDeclaradas
@@ -220,5 +322,5 @@
     return out;
   }
 
-  return { evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
+  return { descuentoAlPieRespaldado: descuentoAlPieRespaldado, descuentoAplicable: descuentoAplicable, descuentoCalzaConPct: descuentoCalzaConPct, evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
 });

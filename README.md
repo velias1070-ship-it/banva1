@@ -62,3 +62,14 @@ banva-etiquetas/
 - Solo hay que cargarlo una vez, queda guardado
 - La app usa la API de Anthropic (Claude) para leer las facturas
 - Funciona en celular y computador
+
+## Descuento al pie de la factura (25-sep-2026)
+
+Proveedores como Chantilly imprimen las líneas a precio de lista y restan un
+«Descuento» global al pie. `cuadre.js` (`descuentoAlPieRespaldado`,
+`descuentoAplicable`) lo acepta sólo si el monto está impreso junto a la palabra
+«Descuento» y si la factura no cuadra directo pero sí restándolo. Las líneas se
+mandan a lista; banvabodega lleva al precio real las que calzan con el
+`precio_lista` de su catálogo (trigger de su migración 0318). Una línea sin
+`precio_lista` o con otro precio queda a lista: el cuadre no lo detecta. Flujo completo, mediciones y límites: `docs/guias/descuento-al-pie-recepcion.md`
+en el repo banvabodega. Tests: `node tools/test-cuadre.js`.

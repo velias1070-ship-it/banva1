@@ -3,7 +3,7 @@
 "use strict";
 
 const path = require("path");
-const { evaluarCuadre, repararCantidades } = require(path.join(__dirname, "..", "cuadre.js"));
+const { evaluarCuadre, repararCantidades, descuentoAlPieRespaldado, descuentoAplicable, descuentoCalzaConPct } = require(path.join(__dirname, "..", "cuadre.js"));
 
 let fallas = 0;
 function check(nombre, cond, detalle) {
@@ -138,6 +138,167 @@ console.log("\nrepararCantidades");
   const r = repararCantidades(p);
   const c = evaluarCuadre(r.parsed);
   check("548981 con cantidades en 0 se reconstruye entera desde los totales", r.reparadas === 19 && c.cuadra === true && c.unidades === 125, JSON.stringify(c));
+}
+
+// ---- Descuento al pie ----
+// Forma de la factura Chantilly 266248 (24-sep-2026): lineas a precio de lista,
+// "Descuento" global al pie y "Monto Neto" ya descontado. Los montos de aca son
+// SINTETICOS (el repo es publico): misma estructura, 10 % al pie.
+// Lineas: 10 x 10.000 + 20 x 5.000 + 48 x 2.000 = 296.000; descuento 29.600; neto 266.400.
+const CHANTILLY_FORMA = {
+  costo_neto: 266400,
+  descuento_pie: 29600,
+  productos: [
+    { sku: "111111111111", cantidad: 10, costo_unitario: 10000 },
+    { sku: "222222222222", cantidad: 20, costo_unitario: 5000 },
+    { sku: "333333333333", cantidad: 48, costo_unitario: 2000 },
+  ],
+};
+// Fragmento del texto OCR con la MISMA disposicion que devolvio Vision para la
+// 266248 (columna "Total Desc." en el encabezado, "Descuento" y su monto en
+// lineas separadas, totales despues).
+const OCR_FORMA = [
+  "Cantidad", "Unidad", "Descripción", "P.Unit", "Total Desc.", "Valor Total",
+  "10.00", "UNI", "111111111111 PRODUCTO A", "10,000", "100,000",
+  "Descuento", "29,600",
+  "Monto Neto", "IVA (19%)", "Total", "266,400", "50,616", "317,016",
+].join("\n");
+
+console.log("descuento al pie");
+{
+  const r = evaluarCuadre(CHANTILLY_FORMA);
+  check("lineas a lista + descuento al pie: cuadra restando el descuento", r.cuadra === true && r.descuento === 29600 && r.delta === 0, JSON.stringify(r));
+}
+{
+  const p = Object.assign({}, CHANTILLY_FORMA, { descuento_pie: 0 });
+  const r = evaluarCuadre(p);
+  check("la misma factura sin descuento leido: NO cuadra (comportamiento de antes)", r.cuadra === false && r.descuento === 0 && r.delta === 29600, JSON.stringify(r));
+}
+{
+  // Factura que HOY cuadra directo + un descuento_pie espurio: no cambia nada.
+  const p = Object.assign({}, OK_548981, { descuento_pie: 5000 });
+  const r = evaluarCuadre(p);
+  check("factura que cuadra directo: el descuento se ignora (descuento 0)", r.cuadra === true && r.descuento === 0 && r.delta === 0, JSON.stringify(r));
+}
+{
+  // Linea mal leida + descuento que NO explica la diferencia: sigue sin cuadrar.
+  const p = JSON.parse(JSON.stringify(CHANTILLY_FORMA));
+  p.productos[1].cantidad = 21;
+  const r = evaluarCuadre(p);
+  check("linea mal leida con descuento: el descuento NO la tapa", r.cuadra === false && r.descuento === 0, JSON.stringify(r));
+}
+{
+  const p = Object.assign({}, CHANTILLY_FORMA, { descuento_pie: "29600" });
+  check("descuento como string numerico se acepta", evaluarCuadre(p).cuadra === true);
+  const q = Object.assign({}, CHANTILLY_FORMA, { descuento_pie: -29600 });
+  check("descuento negativo no aplica", evaluarCuadre(q).cuadra === false);
+}
+{
+  check("respaldado: monto impreso junto a 'Descuento'", descuentoAlPieRespaldado(OCR_FORMA, 29600) === true);
+  check("no respaldado: monto que no esta impreso", descuentoAlPieRespaldado(OCR_FORMA, 29601) === false);
+  check("no respaldado: sin la palabra 'Descuento' (solo la columna 'Total Desc.')",
+    descuentoAlPieRespaldado(OCR_FORMA.replace("Descuento\n", ""), 29600) === false);
+  check("no respaldado: monto 0 o texto vacio", descuentoAlPieRespaldado(OCR_FORMA, 0) === false && descuentoAlPieRespaldado("", 29600) === false);
+  check("respaldado con punto de miles (29.600)", descuentoAlPieRespaldado(OCR_FORMA.replace("29,600", "29.600"), 29600) === true);
+  check("no confunde 'Descuentos varios' pegado a otra palabra", descuentoAlPieRespaldado("Sindescuento\n29,600", 29600) === false);
+}
+{
+  // Tolerancia del frontend (100): misma regla que su cuadre de siempre.
+  check("frontend: aplica dentro de ±100", descuentoAplicable(296050, 266400, 29600, 100) === 29600);
+  check("frontend: no aplica si cuadra directo", descuentoAplicable(266450, 266400, 29600, 100) === 0);
+  // Descuento chico (<= tolerancia): una factura que YA cuadra directo no cambia
+  // su neto mostrado (sin la regla "cuadra directo → 0" esto devolvia 50).
+  check("frontend: cuadra directo con descuento chico → 0", descuentoAplicable(266450, 266400, 50, 100) === 0);
+  check("frontend: no aplica fuera de tolerancia", descuentoAplicable(296500, 266400, 29600, 100) === 0);
+  check("frontend: sin neto no aplica", descuentoAplicable(296000, 0, 29600, 100) === 0);
+}
+
+console.log("descuento al pie — hallazgos de la revision");
+{
+  // Hallazgo 1 (escenario exacto de la revision): la palabra aparece en las
+  // condiciones de pago y el "monto" es un precio unitario impreso lejos.
+  const ocr = [
+    "Condiciones: descuento 2% pago contado",
+    "Glosa sin montos",
+    "Otra linea",
+    "10", "PRODUCTO A", "5,000", "50,000",
+    "20", "PRODUCTO B", "3,400", "68,000",
+    "Monto Neto", "118,000",
+  ].join("\n");
+  check("precio unitario lejos de 'Descuento' NO respalda", descuentoAlPieRespaldado(ocr, 5000) === false);
+  check("el 2% de 'descuento 2%' no es un monto", descuentoAlPieRespaldado(ocr, 2) === false);
+}
+{
+  check("'Descuento 10%' en una linea y el monto en la siguiente: respalda el monto",
+    descuentoAlPieRespaldado("Descuento 10%\n29,600\nMonto Neto", 29600) === true);
+  check("'Descuento 10%': el 10 NO respalda", descuentoAlPieRespaldado("Descuento 10%\n29,600", 10) === false);
+  check("porcentaje con miles y espacio ('1.000 %') no es un monto", descuentoAlPieRespaldado("Descuento 1.000 %", 1000) === false);
+  check("'Descuento $29.600' misma linea", descuentoAlPieRespaldado("Descuento $29.600", 29600) === true);
+  check("'Descuento 29.600,00' con decimales", descuentoAlPieRespaldado("Descuento 29.600,00", 29600) === true);
+  check("monto a 3 lineas del 'Descuento', con texto+numero entre medio, no respalda",
+    descuentoAlPieRespaldado("Descuento\na 12 x\nb\n29,600", 29600) === false);
+}
+{
+  // Hallazgo 2/3: el % del proveedor. Suma a lista 296.000, 10 %.
+  check("pct: descuento = 10 % exacto de la suma → calza", descuentoCalzaConPct(296000, 29600, 10, 3) === true);
+  check("pct: proveedor sin % (null) → no calza", descuentoCalzaConPct(296000, 29600, null, 3) === false);
+  check("pct: proveedor con 0 % → no calza", descuentoCalzaConPct(296000, 29600, 0, 3) === false);
+  check("pct: redondeo por linea dentro de 1 peso por linea → calza", descuentoCalzaConPct(296000, 29602, 10, 3) === true);
+  check("pct: descuento chico ('10') no calza con 10 % de la suma", descuentoCalzaConPct(296000, 10, 10, 3) === false);
+}
+{
+  // La propiedad que importa: con el % del proveedor, NINGUNA cantidad
+  // sobreleida o subleida puede cuadrar usando el descuento impreso.
+  // Barrido: cada linea de CHANTILLY_FORMA con k = -5..5 (k != 0).
+  let tapadas = 0, probadas = 0;
+  CHANTILLY_FORMA.productos.forEach((_, i) => {
+    for (let k = -5; k <= 5; k++) {
+      if (k === 0) continue;
+      const p = JSON.parse(JSON.stringify(CHANTILLY_FORMA));
+      p.productos[i].cantidad += k;
+      if (p.productos[i].cantidad <= 0) continue;
+      probadas++;
+      const suma = p.productos.reduce((s, x) => s + x.cantidad * x.costo_unitario, 0);
+      const d = descuentoAplicable(suma, p.costo_neto, p.descuento_pie, 100);
+      if (d > 0 && descuentoCalzaConPct(suma, d, 10, 3)) tapadas++;
+    }
+  });
+  check("barrido de " + probadas + " lecturas malas: el descuento no tapa ninguna", tapadas === 0 && probadas > 20, "tapadas=" + tapadas);
+}
+
+// Caso donde SOLO el % del proveedor salva (revisión ronda 2): el barrido de
+// arriba nunca llega al chequeo del %, porque con el descuento verdadero
+// descuentoAplicable ya devuelve 0. Acá «Descuento» es encabezado de columna,
+// una cantidad está sobreleída (20→21) y el modelo transcribe como descuento
+// un número de la fila (5,000) que justo tapa el error.
+{
+  const ocr = ["Cantidad UNI Descripcion P.Unit Descuento Valor Total",
+    "10 UNI PRODUCTO A 10,000 100,000", "20 UNI PRODUCTO B 5,000 100,000",
+    "48 UNI PRODUCTO C 2,000 96,000", "Monto Neto 296,000"].join("\n");
+  const suma = 10 * 10000 + 21 * 5000 + 48 * 2000; // 301.000, B sobreleída
+  const respaldado = descuentoAlPieRespaldado(ocr, 5000);
+  const d = descuentoAplicable(suma, 296000, 5000, 100);
+  check("encabezado de columna: la ventana lo respalda (límite conocido)", respaldado === true);
+  check("encabezado de columna: el cuadre solo lo taparía", d === 5000, "d=" + d);
+  check("encabezado de columna: el % del proveedor lo frena", !(respaldado && d > 0 && descuentoCalzaConPct(suma, d, 10, 3)));
+}
+
+// Rotulos en columna (forma real de la 266247, montos sinteticos): Vision
+// lista los rotulos del pie y despues los montos.
+{
+  const ocr = ["P.Unit Total Desc.", "1,000", "Valor Total", "50,000", "Descuento",
+    "Monto Neto", "IVA (19%)", "Total", "5,000", "45,000", "8,550", "53,550",
+    "PERSONA QUE RECIBE"].join("\n");
+  check("columna: el descuento es el monto en la posicion de «Descuento»", descuentoAlPieRespaldado(ocr, 5000) === true);
+  check("columna: el neto (posicion de «Monto Neto») no pasa por descuento", descuentoAlPieRespaldado(ocr, 45000) === false);
+  check("columna: el IVA no pasa", descuentoAlPieRespaldado(ocr, 8550) === false);
+  check("columna: el total no pasa", descuentoAlPieRespaldado(ocr, 53550) === false);
+  check("columna: el valor total de la linea (antes del rotulo) no pasa", descuentoAlPieRespaldado(ocr, 50000) === false);
+  const conSub = ["Subtotal", "Descuento", "Monto Neto", "50,000", "5,000", "45,000"].join("\n");
+  check("columna: con un rotulo antes, toma la 2a posicion", descuentoAlPieRespaldado(conSub, 5000) === true);
+  check("columna: con un rotulo antes, el subtotal no pasa", descuentoAlPieRespaldado(conSub, 50000) === false);
+  const cortado = ["Descuento", "Monto Neto", "PERSONA QUE RECIBE", "Nombre:", "algo 12 texto", "5,000"].join("\n");
+  check("columna: una linea con texto y numero corta el bloque de montos", descuentoAlPieRespaldado(cortado, 5000) === false);
 }
 
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");

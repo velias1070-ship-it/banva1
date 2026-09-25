@@ -3,7 +3,25 @@ const config = {
 };
 
 // Cuadre puro de la extraccion contra el neto (cuadre.js, testeado en node).
-const { evaluarCuadre, repararCantidades, compararProductos, verificarCantidadPorOrdenOcr } = require("../cuadre.js");
+const { evaluarCuadre, repararCantidades, compararProductos, verificarCantidadPorOrdenOcr, descuentoAlPieRespaldado } = require("../cuadre.js");
+
+// Descuento al pie (cuadre.js): el modelo lo transcribe, pero solo vale si el
+// monto esta IMPRESO en el texto OCR junto a la palabra "Descuento". Si no,
+// se pone en 0 — un descuento inventado no puede tapar una linea mal leida.
+// Devuelve lo que paso para exponerlo en `extraccion` (Regla 4).
+function validarDescuentoPie(parsed, ocrText) {
+  // El prompt pide entero, pero si el modelo devuelve "137.656" (string con
+  // miles) Number() daria 137.656: se normaliza a digitos.
+  const crudo = parsed && parsed.descuento_pie;
+  const leido = typeof crudo === "string" ? Number(crudo.replace(/[^\d]/g, "")) || 0 : Number(crudo) || 0;
+  if (!parsed || leido <= 0) {
+    if (parsed) parsed.descuento_pie = 0;
+    return { leido: 0, respaldado: null };
+  }
+  const respaldado = descuentoAlPieRespaldado(ocrText, leido);
+  parsed.descuento_pie = respaldado ? leido : 0;
+  return { leido: leido, respaldado: respaldado };
+}
 
 // Presupuesto minimo que tiene que quedar para lanzar una SEGUNDA extraccion
 // (120s de timeout de Claude + margen). Si no alcanza, se devuelve la primera
@@ -190,6 +208,7 @@ REGLAS:
 - total_unidades: el número que sigue a "Total Unidades" al pie de la tabla — entero, TRANSCRITO. Si no aparece, 0. Control final: la suma de las cantidades debe dar total_unidades
 - Los precios en formato chileno usan punto como separador de miles (3.400 = tres mil cuatrocientos). Devuelve como entero: 3400
 - Montos totales al final: Neto, IVA (19%), Total
+- descuento_pie: el monto de la línea "Descuento" que aparece al PIE de la factura, en la zona de totales (antes del Neto), cuando el neto ya viene con ese descuento restado — entero, TRANSCRITO. NO es la columna de descuento de cada fila ("Desc.", "Total Desc."): esos no van acá. Si no hay línea "Descuento" al pie, 0. Los costo_unitario de las filas se transcriben TAL COMO ESTÁN IMPRESOS (no les restes el descuento)
 - NO inventes productos ni SKUs. Si una línea es ilegible o dudosa NO la omitas en silencio: inclúyela con confianza "baja", con lo que hayas podido leer, y cantidad 0 si la cantidad no se lee. El sistema le mostrará esa línea al operador; una línea omitida desaparece sin que nadie lo note
 - Cada fila de la tabla es un producto SEPARADO
 
@@ -200,7 +219,7 @@ REFERENCIAS DE ORDEN DE COMPRA (opcionales, NO afectan la lista de productos):
 
 Responde SOLO JSON válido, COMPACTO: todo en una sola línea, sin saltos de línea,
 sin indentación y sin espacios entre campos. Nada de texto antes ni después del JSON.
-{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"total_unidades":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"valor_total":0,"confianza":"alta"}]}`;
+{"folio":"","proveedor":"","referencia_oc":null,"ovt":null,"fvta":null,"costo_neto":0,"iva":0,"costo_bruto":0,"descuento_pie":0,"total_unidades":0,"productos":[{"sku":"","nombre":"","cantidad":0,"costo_unitario":0,"valor_total":0,"confianza":"alta"}]}`;
 
   // Modelos en orden de preferencia. Si Anthropic retira el primero
   // (404 not_found_error), cae automaticamente al siguiente y la app NO se cae.
@@ -376,6 +395,8 @@ async function handler(req, res) {
       console.log("Step 2: Structuring with Claude Sonnet...");
       let parsed = await structureWithClaude(ocrText, anthropicKey, finPresupuesto);
       console.log("Claude extracted", parsed.productos?.length || 0, "products");
+      const desc1 = validarDescuentoPie(parsed, ocrText);
+      if (desc1.respaldado === false) console.log("descuento_pie " + desc1.leido + " NO está impreso en el OCR: se ignora");
 
       // Step 2a: reparacion DETERMINISTA por linea (cuadre.js). Vision pierde
       // las cantidades de un digito pero lee bien precio y "Valor Total" de cada
@@ -411,6 +432,8 @@ async function handler(req, res) {
         cuadra_intento1: cuadre1.cuadra,
         delta_intento1: cuadre1.evaluable ? cuadre1.delta : null,
         total_unidades: cuadre1.unidadesDeclaradas,
+        descuento_pie_intento1: desc1,
+        descuento_aplicado_intento1: cuadre1.descuento,
         cuadra_unidades_intento1: cuadre1.cuadraUnidades,
         cuadra_final: cuadre1.cuadra,
         reintento_omitido: null,
@@ -434,12 +457,16 @@ async function handler(req, res) {
               "las columnas separadas y cada número pertenece a UNA sola fila, en orden. Reasigná fila por fila " +
               "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control — transcribí ese " +
               "valor_total y derivá la cantidad como valor_total ÷ costo_unitario —, y comprobá que la suma de " +
-              "todas las líneas sea exactamente el neto antes de responder."
+              "todas las líneas sea exactamente el neto antes de responder (si la factura trae una línea " +
+              "\"Descuento\" al pie, la suma de líneas menos ese descuento_pie es la que debe dar el neto; " +
+              "los costo_unitario igual van tal como están impresos)."
             : ""; // sin pista: corrida INDEPENDIENTE, para que el consenso valga como segunda opinion
           console.log(fallo1
             ? "Cuadre falló (suma " + cuadre1.suma + " vs neto " + cuadre1.neto + ", " + cuadre1.unidades + " uds): reintentando la extracción"
             : "Cuadre OK: segunda extracción independiente para consenso");
           let parsed2 = await structureWithClaude(ocrText, anthropicKey, finPresupuesto, pista, true);
+          const desc2 = validarDescuentoPie(parsed2, ocrText);
+          if (desc2.respaldado === false) console.log("descuento_pie (reintento) " + desc2.leido + " NO está impreso en el OCR: se ignora");
           const rep2 = repararCantidades(parsed2);
           if (rep2.reparadas > 0) {
             parsed2 = rep2.parsed;
@@ -451,6 +478,8 @@ async function handler(req, res) {
           extraccion.cuadra_intento2 = cuadre2.cuadra;
           extraccion.delta_intento2 = cuadre2.evaluable ? cuadre2.delta : null;
           extraccion.cuadra_unidades_intento2 = cuadre2.cuadraUnidades;
+          extraccion.descuento_pie_intento2 = desc2;
+          extraccion.descuento_aplicado_intento2 = cuadre2.descuento;
 
           // Eleccion del resultado final (misma regla de siempre): si el primero
           // fallo y el segundo cuadra, gana el segundo; si no, se queda el primero.

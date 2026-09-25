@@ -254,9 +254,30 @@
     for (const s of catalogo) {
       for (let i = 0; i < s.length; i++) catHash = (catHash * 31 + s.charCodeAt(i)) | 0;
     }
-    const cacheKey = String(ocrText).length + "|" + String(ocrText).slice(0, 80) +
+    // Clave con el texto OCR COMPLETO: con solo largo + 80 primeros caracteres,
+    // dos lecturas del mismo largo con el mismo encabezado de proveedor y las
+    // mismas lineas reusaban el resultado viejo (lo destapo un test del
+    // 25-sep-2026). Comparar el string entero es barato frente al levenshtein.
+    const cacheKey = String(ocrText) +
       "|" + skusLinea.slice().sort().join(",") + "|" + catalogo.length + "|" + catHash;
     if (cacheKey === _codCacheKey) return _codCacheVal;
+
+    // Factura de codigos NUMERICOS (EAN de 12-13 digitos, p.ej. Chantilly): un
+    // token alfanumerico que no se parece (distancia > 2) a NINGUN SKU del
+    // catalogo es ruido de lectura del encabezado, no un producto. Caso real:
+    // «Tel/Fax:» de la lista de sucursales leido como «WSWMA999» en todas las
+    // facturas del proveedor. Censo sobre las 72 facturas guardadas con texto
+    // OCR (recepciones de App Etiquetas, 25-sep-2026): alarmas de este candado
+    // 2 → 0 (las dos eran ese ruido); linea omitida simulada 729/729 detectadas
+    // antes y despues, y 408/408 si ademas el SKU omitido se saca del catalogo.
+    // Si la factura trae UN solo SKU alfanumerico, o no hay catalogo, no aplica.
+    const facturaNumerica = skusPresentes.length > 0 &&
+      skusPresentes.every(function (s) { return /^[0-9]+$/.test(s); });
+    function lejosDelCatalogo(cod) {
+      if (catalogo.length === 0) return false;
+      for (const c of catalogo) { if (levenshtein(cod, c, 2) <= 2) return false; }
+      return true;
+    }
 
     const candidatos = new Set();
     String(ocrText).toUpperCase().split(/[^A-Z0-9]+/).forEach(function (t) {
@@ -290,6 +311,7 @@
         }
       }
       if (esFragmento) return;
+      if (facturaNumerica && lejosDelCatalogo(cod)) return;
 
       let minLinea = 3;
       for (const s of skusLinea) {
