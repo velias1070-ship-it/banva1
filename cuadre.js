@@ -25,13 +25,21 @@
   // aunque se hubiera leido perfecta.
   //
   // Tres reglas para que el descuento NO pueda tapar una lectura mala:
-  // 1. descuentoAlPieRespaldado: el monto tiene que estar IMPRESO — el texto
-  //    OCR trae la palabra "Descuento" (no "Desc." de columna) y un numero cuyo
-  //    valor es exactamente ese monto. Si no, vale 0. Nunca se deduce.
+  // 1. descuentoAlPieRespaldado: el monto tiene que estar IMPRESO JUNTO a la
+  //    palabra "Descuento" (no "Desc." de columna): en la misma linea o en las
+  //    2 siguientes del texto OCR, sin contar porcentajes ("10%"). Si no, vale
+  //    0. Nunca se deduce. (Revision del PR: aceptar CUALQUIER numero del texto
+  //    dejaba que un precio unitario tapara una cantidad sobreleida.)
   // 2. descuentoAplicable: el descuento solo se usa si la factura NO cuadra
   //    directo y SI cuadra restandolo (dentro de la tolerancia). Una factura
   //    que hoy cuadra sigue cuadrando igual: el descuento no cambia nada ahi.
-  // 3. El resto de los controles (unidades, consenso, candados) no se toca.
+  // 3. descuentoCalzaConPct (sólo frontend, que conoce al proveedor): el
+  //    proveedor tiene que tener descuento_comercial_pct en banvabodega y el
+  //    monto tiene que ser ese % de la suma de lineas. Con eso una linea mal
+  //    leida no puede cuadrar: cambia la suma, cambia el % esperado, y el
+  //    descuento impreso deja de calzar. Tambien asegura que el trigger 0318
+  //    de banvabodega lleve cada linea a su precio real (sin % no lo haria).
+  // 4. El resto de los controles (unidades, consenso, candados) no se toca.
   // Medido en prod 25-sep-2026 sobre recepciones created_by='App Etiquetas'
   // con factura_original.ocr_text (69, desde 12-ago-2026): 0 traen la palabra
   // "descuento" (control positivo: 65 traen "descripci"). Ninguna factura
@@ -39,10 +47,31 @@
   function descuentoAlPieRespaldado(ocrText, monto) {
     const m = num(monto);
     if (!(m > 0) || !ocrText) return false;
-    const texto = String(ocrText);
-    if (!/(^|[^a-z])descuento([^a-z]|$)/i.test(texto)) return false;
-    const numeros = texto.match(/\d{1,3}(?:[.,]\d{3})+|\d+/g) || [];
-    return numeros.some(function (t) { return Number(t.replace(/[.,]/g, "")) === m; });
+    const lineas = String(ocrText).split(/\n/);
+    const palabra = /(^|[^a-z])descuento([^a-z]|$)/i;
+    // Numero con separador de miles chileno o ingles; el lookahead descarta
+    // porcentajes ("10%", "10 %"). Decimales ",00" no cuentan como miles.
+    const reNum = /\d{1,3}(?:[.,]\d{3})+(?![\d%])(?!\s*%)|\d+(?![\d%.,])(?!\s*%)/g;
+    for (let i = 0; i < lineas.length; i++) {
+      const hit = palabra.exec(lineas[i]);
+      if (!hit) continue;
+      const ventana = [lineas[i].slice(hit.index + hit[0].length)]
+        .concat(lineas.slice(i + 1, i + 3)).join("\n");
+      const numeros = ventana.match(reNum) || [];
+      if (numeros.some(function (t) { return Number(t.replace(/[.,]/g, "")) === m; })) return true;
+    }
+    return false;
+  }
+
+  // El descuento tiene que ser el % comercial del proveedor sobre la suma de
+  // lineas a lista. Tolerancia: 1 peso por linea (el proveedor puede redondear
+  // el descuento linea a linea). pct null/0 = proveedor sin descuento → false.
+  function descuentoCalzaConPct(suma, descuento, pct, nLineas) {
+    const d = num(descuento);
+    const p = num(pct);
+    if (!(d > 0) || !(p > 0) || !(num(suma) > 0)) return false;
+    const esperado = num(suma) * p / 100;
+    return Math.abs(d - esperado) <= Math.max(1, num(nLineas));
   }
 
   // Devuelve el descuento que corresponde restar (o 0). `tolerancia` en pesos:
@@ -262,5 +291,5 @@
     return out;
   }
 
-  return { descuentoAlPieRespaldado: descuentoAlPieRespaldado, descuentoAplicable: descuentoAplicable, evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
+  return { descuentoAlPieRespaldado: descuentoAlPieRespaldado, descuentoAplicable: descuentoAplicable, descuentoCalzaConPct: descuentoCalzaConPct, evaluarCuadre: evaluarCuadre, repararCantidades: repararCantidades, compararProductos: compararProductos, verificarCantidadPorOrdenOcr: verificarCantidadPorOrdenOcr };
 });

@@ -146,7 +146,11 @@ async function resolveProveedor(proveedor, rut) {
     clearTimeout(timeoutId);
     if (!resp.ok) throw new Error("status " + resp.status);
     const data = await resp.json();
-    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null, fuente: "resolve" };
+    // descuento_comercial_pct: campo agregado al endpoint el 25-sep-2026. Un
+    // banvabodega que no lo mande deja null → el descuento al pie no aplica.
+    const pct = Number(data.descuento_comercial_pct);
+    return { nombre_canonico: data.nombre_canonico || proveedor, proveedor_id: data.id || null, fuente: "resolve",
+      descuento_comercial_pct: Number.isFinite(pct) ? pct : null };
   } catch (e) {
     console.warn("[resolveProveedor] fallback con razon_social cruda:", e?.message || e);
     return { nombre_canonico: proveedor, proveedor_id: null, fuente: "fallback" };
@@ -714,10 +718,19 @@ function App() {
   // el OCR en api/process.js. Solo se resta si la factura NO cuadra directo y
   // SI cuadra restandolo (cuadre.js, descuentoAplicable). 0 = no hay.
   const [descuentoPie, setDescuentoPie] = useState(0);
-  // Sin cuadre.js cargado devuelve 0: se comporta como antes (falla cerrada).
-  const descuentoQueCuadra = (sumaLineas) => window.BanvaCuadre
-    ? window.BanvaCuadre.descuentoAplicable(sumaLineas, Number(costoNeto) || 0, descuentoPie, 100)
-    : 0;
+  // % de descuento comercial del proveedor en banvabodega (lo trae el resolve
+  // del panel de OC). null = no se pudo saber → el descuento NO se aplica.
+  const [proveedorDescPct, setProveedorDescPct] = useState(null);
+  // Sin cuadre.js cargado, sin % del proveedor, o con un monto que no es ese %
+  // de la suma, devuelve 0: se comporta como antes (falla cerrada).
+  const descuentoQueCuadra = (sumaLineas) => {
+    const C = window.BanvaCuadre;
+    if (!C) return 0;
+    const d = C.descuentoAplicable(sumaLineas, Number(costoNeto) || 0, descuentoPie, 100);
+    if (!(d > 0)) return 0;
+    const nLineas = extractedProducts.filter(p => Number(p.cantidad) > 0).length;
+    return C.descuentoCalzaConPct(sumaLineas, d, proveedorDescPct, nLineas) ? d : 0;
+  };
   // El OCR proceso una factura pero NO logro leer el total (tipico: foto que no
   // incluye la parte de abajo, donde estan los totales... y tambien los ultimos
   // productos). En ese caso el cuadre no tiene contra que comparar y se apagaba
@@ -1453,7 +1466,7 @@ function App() {
       setWmsErrorEsDup(!!err.esDupFvta);
       setWmsStatus("error");
     }
-  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, descuentoPie, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo, skusCatalogo, candadosOverride]);
+  }, [folioFactura, proveedorFactura, invoiceImage, extractedProducts, costoNeto, iva, costoBruto, descuentoPie, proveedorDescPct, netoManual, refOcOcr, refOvt, refFvta, ocSeleccion, sinOcMotivo, ocValidResult, ocrTextRaw, parsedCrudo, skusCatalogo, candadosOverride]);
 
   // ---- Último costo conocido por SKU (de la última recepción) ----
   // Fuente válida de costo (recepción real, no promedio inferido). Solo sugerencia: el
@@ -1495,7 +1508,7 @@ function App() {
   const cargarVinculoOC = useCallback(async () => {
     const sb = getWMSClient();
     if (!sb) { setOcStatus("na"); return; }
-    setOcStatus("loading"); setOcNota("");
+    setOcStatus("loading"); setOcNota(""); setProveedorDescPct(null);
     // Cada carga arranca limpia (también al "recalcular" a mano). Las refs crudas
     // (ref_oc_ocr/ovt/fvta) NO se tocan acá: son datos de OCR, no decisión.
     setOcSeleccion(null); setSinOcMotivo(""); setOcValidResult(null); setOcCandidatas([]);
@@ -1510,6 +1523,7 @@ function App() {
     try {
       const r = await resolveProveedor(proveedorFactura, null);
       proveedor_id = r?.proveedor_id || null;
+      setProveedorDescPct(r?.descuento_comercial_pct ?? null);
     } catch (_) { proveedor_id = null; }
     setOcProveedorId(proveedor_id);
 
@@ -2666,6 +2680,14 @@ function App() {
                           − Descuento al pie de la factura: {fmt(descuento)} → {fmt(sumaLineas - descuento)} (las líneas van a precio de lista)
                         </div>
                       )}
+                      {hasIssue && descuento === 0 && Number(descuentoPie) > 0 && (
+                        <div style={{marginTop: 6, fontSize: 11, color: "#F59E0B"}}>
+                          La factura trae un descuento al pie de {fmt(Number(descuentoPie))}, pero no se aplicó:
+                          {!(Number(proveedorDescPct) > 0)
+                            ? " el proveedor no tiene descuento comercial cargado en banvabodega (Admin → Compras → Proveedores)."
+                            : " no es el " + proveedorDescPct + "% de la suma de líneas, o no explica la diferencia. Revisá las cantidades y precios contra el papel."}
+                        </div>
+                      )}
                       {/* Unidades vs "Total Unidades" impreso: el único control de
                           cabecera que la plata no puede fingir. Advierte (no
                           bloquea): la protección por línea es el candado F. */}
@@ -3257,7 +3279,7 @@ function App() {
                 setFolioFactura("");
                 setProveedorFactura("");
                 setWmsStatus(""); setWmsError(""); setWmsErrorEsDup(false);
-                setCostoNeto(0); setIva(0); setCostoBruto(0); setTotalUnidades(0); setDescuentoPie(0);
+                setCostoNeto(0); setIva(0); setCostoBruto(0); setTotalUnidades(0); setDescuentoPie(0); setProveedorDescPct(null);
                 setNetoManual(false);
                 setRefOcOcr(""); setRefOvt(""); setRefFvta("");
                 setOcStatus("idle"); setOcProveedorId(null); setOcCandidatas([]);

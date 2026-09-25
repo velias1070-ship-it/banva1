@@ -10,7 +10,10 @@ const { evaluarCuadre, repararCantidades, compararProductos, verificarCantidadPo
 // se pone en 0 — un descuento inventado no puede tapar una linea mal leida.
 // Devuelve lo que paso para exponerlo en `extraccion` (Regla 4).
 function validarDescuentoPie(parsed, ocrText) {
-  const leido = Number(parsed && parsed.descuento_pie) || 0;
+  // El prompt pide entero, pero si el modelo devuelve "137.656" (string con
+  // miles) Number() daria 137.656: se normaliza a digitos.
+  const crudo = parsed && parsed.descuento_pie;
+  const leido = typeof crudo === "string" ? Number(crudo.replace(/[^\d]/g, "")) || 0 : Number(crudo) || 0;
   if (!parsed || leido <= 0) {
     if (parsed) parsed.descuento_pie = 0;
     return { leido: 0, respaldado: null };
@@ -454,7 +457,9 @@ async function handler(req, res) {
               "las columnas separadas y cada número pertenece a UNA sola fila, en orden. Reasigná fila por fila " +
               "usando 'Valor Total' de cada línea (= cantidad × precio unitario) como control — transcribí ese " +
               "valor_total y derivá la cantidad como valor_total ÷ costo_unitario —, y comprobá que la suma de " +
-              "todas las líneas sea exactamente el neto antes de responder."
+              "todas las líneas sea exactamente el neto antes de responder (si la factura trae una línea " +
+              "\"Descuento\" al pie, la suma de líneas menos ese descuento_pie es la que debe dar el neto; " +
+              "los costo_unitario igual van tal como están impresos)."
             : ""; // sin pista: corrida INDEPENDIENTE, para que el consenso valga como segunda opinion
           console.log(fallo1
             ? "Cuadre falló (suma " + cuadre1.suma + " vs neto " + cuadre1.neto + ", " + cuadre1.unidades + " uds): reintentando la extracción"

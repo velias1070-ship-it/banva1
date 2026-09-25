@@ -3,7 +3,7 @@
 "use strict";
 
 const path = require("path");
-const { evaluarCuadre, repararCantidades, descuentoAlPieRespaldado, descuentoAplicable } = require(path.join(__dirname, "..", "cuadre.js"));
+const { evaluarCuadre, repararCantidades, descuentoAlPieRespaldado, descuentoAplicable, descuentoCalzaConPct } = require(path.join(__dirname, "..", "cuadre.js"));
 
 let fallas = 0;
 function check(nombre, cond, detalle) {
@@ -211,6 +211,59 @@ console.log("descuento al pie");
   check("frontend: cuadra directo con descuento chico → 0", descuentoAplicable(266450, 266400, 50, 100) === 0);
   check("frontend: no aplica fuera de tolerancia", descuentoAplicable(296500, 266400, 29600, 100) === 0);
   check("frontend: sin neto no aplica", descuentoAplicable(296000, 0, 29600, 100) === 0);
+}
+
+console.log("descuento al pie — hallazgos de la revision");
+{
+  // Hallazgo 1 (escenario exacto de la revision): la palabra aparece en las
+  // condiciones de pago y el "monto" es un precio unitario impreso lejos.
+  const ocr = [
+    "Condiciones: descuento 2% pago contado",
+    "Glosa sin montos",
+    "Otra linea",
+    "10", "PRODUCTO A", "5,000", "50,000",
+    "20", "PRODUCTO B", "3,400", "68,000",
+    "Monto Neto", "118,000",
+  ].join("\n");
+  check("precio unitario lejos de 'Descuento' NO respalda", descuentoAlPieRespaldado(ocr, 5000) === false);
+  check("el 2% de 'descuento 2%' no es un monto", descuentoAlPieRespaldado(ocr, 2) === false);
+}
+{
+  check("'Descuento 10%' en una linea y el monto en la siguiente: respalda el monto",
+    descuentoAlPieRespaldado("Descuento 10%\n29,600\nMonto Neto", 29600) === true);
+  check("'Descuento 10%': el 10 NO respalda", descuentoAlPieRespaldado("Descuento 10%\n29,600", 10) === false);
+  check("porcentaje con miles y espacio ('1.000 %') no es un monto", descuentoAlPieRespaldado("Descuento 1.000 %", 1000) === false);
+  check("'Descuento $29.600' misma linea", descuentoAlPieRespaldado("Descuento $29.600", 29600) === true);
+  check("'Descuento 29.600,00' con decimales", descuentoAlPieRespaldado("Descuento 29.600,00", 29600) === true);
+  check("monto a 3 lineas del 'Descuento' ya no respalda",
+    descuentoAlPieRespaldado("Descuento\na\nb\n29,600", 29600) === false);
+}
+{
+  // Hallazgo 2/3: el % del proveedor. Suma a lista 296.000, 10 %.
+  check("pct: descuento = 10 % exacto de la suma → calza", descuentoCalzaConPct(296000, 29600, 10, 3) === true);
+  check("pct: proveedor sin % (null) → no calza", descuentoCalzaConPct(296000, 29600, null, 3) === false);
+  check("pct: proveedor con 0 % → no calza", descuentoCalzaConPct(296000, 29600, 0, 3) === false);
+  check("pct: redondeo por linea dentro de 1 peso por linea → calza", descuentoCalzaConPct(296000, 29602, 10, 3) === true);
+  check("pct: descuento chico ('10') no calza con 10 % de la suma", descuentoCalzaConPct(296000, 10, 10, 3) === false);
+}
+{
+  // La propiedad que importa: con el % del proveedor, NINGUNA cantidad
+  // sobreleida o subleida puede cuadrar usando el descuento impreso.
+  // Barrido: cada linea de CHANTILLY_FORMA con k = -5..5 (k != 0).
+  let tapadas = 0, probadas = 0;
+  CHANTILLY_FORMA.productos.forEach((_, i) => {
+    for (let k = -5; k <= 5; k++) {
+      if (k === 0) continue;
+      const p = JSON.parse(JSON.stringify(CHANTILLY_FORMA));
+      p.productos[i].cantidad += k;
+      if (p.productos[i].cantidad <= 0) continue;
+      probadas++;
+      const suma = p.productos.reduce((s, x) => s + x.cantidad * x.costo_unitario, 0);
+      const d = descuentoAplicable(suma, p.costo_neto, p.descuento_pie, 100);
+      if (d > 0 && descuentoCalzaConPct(suma, d, 10, 3)) tapadas++;
+    }
+  });
+  check("barrido de " + probadas + " lecturas malas: el descuento no tapa ninguna", tapadas === 0 && probadas > 20, "tapadas=" + tapadas);
 }
 
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");
