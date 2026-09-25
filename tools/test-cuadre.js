@@ -266,5 +266,22 @@ console.log("descuento al pie — hallazgos de la revision");
   check("barrido de " + probadas + " lecturas malas: el descuento no tapa ninguna", tapadas === 0 && probadas > 20, "tapadas=" + tapadas);
 }
 
+// Caso donde SOLO el % del proveedor salva (revisión ronda 2): el barrido de
+// arriba nunca llega al chequeo del %, porque con el descuento verdadero
+// descuentoAplicable ya devuelve 0. Acá «Descuento» es encabezado de columna,
+// una cantidad está sobreleída (20→21) y el modelo transcribe como descuento
+// un número de la fila (5,000) que justo tapa el error.
+{
+  const ocr = ["Cantidad UNI Descripcion P.Unit Descuento Valor Total",
+    "10 UNI PRODUCTO A 10,000 100,000", "20 UNI PRODUCTO B 5,000 100,000",
+    "48 UNI PRODUCTO C 2,000 96,000", "Monto Neto 296,000"].join("\n");
+  const suma = 10 * 10000 + 21 * 5000 + 48 * 2000; // 301.000, B sobreleída
+  const respaldado = descuentoAlPieRespaldado(ocr, 5000);
+  const d = descuentoAplicable(suma, 296000, 5000, 100);
+  check("encabezado de columna: la ventana lo respalda (límite conocido)", respaldado === true);
+  check("encabezado de columna: el cuadre solo lo taparía", d === 5000, "d=" + d);
+  check("encabezado de columna: el % del proveedor lo frena", !(respaldado && d > 0 && descuentoCalzaConPct(suma, d, 10, 3)));
+}
+
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");
 process.exit(fallas === 0 ? 0 : 1);

@@ -69,6 +69,7 @@ Proveedores como Chantilly imprimen las líneas a precio de lista y restan un
 «Descuento» global al pie. `cuadre.js` (`descuentoAlPieRespaldado`,
 `descuentoAplicable`) lo acepta sólo si el monto está impreso junto a la palabra
 «Descuento» y si la factura no cuadra directo pero sí restándolo. Las líneas se
-mandan a lista; banvabodega las lleva al precio real (trigger de su migración
-0318). Flujo completo, mediciones y límites: `docs/guias/descuento-al-pie-recepcion.md`
+mandan a lista; banvabodega lleva al precio real las que calzan con el
+`precio_lista` de su catálogo (trigger de su migración 0318). Una línea sin
+`precio_lista` o con otro precio queda a lista: el cuadre no lo detecta. Flujo completo, mediciones y límites: `docs/guias/descuento-al-pie-recepcion.md`
 en el repo banvabodega. Tests: `node tools/test-cuadre.js`.
