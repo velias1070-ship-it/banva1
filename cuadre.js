@@ -55,12 +55,43 @@
     for (let i = 0; i < lineas.length; i++) {
       const hit = palabra.exec(lineas[i]);
       if (!hit) continue;
-      const ventana = [lineas[i].slice(hit.index + hit[0].length)]
+      const resto = lineas[i].slice(hit.index + hit[0].length);
+      // Modo columna: «Descuento» solo en su linea y seguido de otro rotulo.
+      // Ahi la ventana de 2 lineas no sirve (tomaria el monto de otro rotulo)
+      // y manda el emparejamiento por posicion de mas abajo.
+      const modoColumna = sinNumero(resto) && i + 1 < lineas.length &&
+        lineas[i + 1].trim() !== "" && sinNumero(lineas[i + 1]);
+      const ventana = modoColumna ? "" : [resto]
         .concat(lineas.slice(i + 1, i + 3)).join("\n");
       const numeros = ventana.match(reNum) || [];
       if (numeros.some(function (t) { return Number(t.replace(/[.,]/g, "")) === m; })) return true;
+      // Rotulos en columna: Vision a veces lista todos los rotulos del pie y
+      // DESPUES todos los montos ("Descuento / Monto Neto / IVA (19%) / Total /
+      // 21,552 / 193,968 / ..."; factura 266247, 25-sep-2026). Ahi el monto del
+      // descuento es el que ocupa, en el bloque de montos, la MISMA posicion que
+      // «Descuento» en el bloque de rotulos. Rotulo = linea sin ningun numero
+      // (un porcentaje no cuenta); monto = linea que es solo un numero.
+      if (!modoColumna) continue;
+      let ini = i;
+      while (ini > 0 && sinNumero(lineas[ini - 1]) && lineas[ini - 1].trim()) ini--;
+      let fin = i + 1;
+      while (fin < lineas.length && sinNumero(lineas[fin])) fin++;
+      const k = i - ini;
+      let n = 0;
+      for (let j = fin; j < lineas.length; j++) {
+        const v = soloMonto(lineas[j]);
+        if (v === null) break;
+        if (n === k) { if (v === m) return true; break; }
+        n++;
+      }
     }
     return false;
+
+    function sinNumero(l) { reNum.lastIndex = 0; return !reNum.test(l); }
+    function soloMonto(l) {
+      const t = String(l).trim().replace(/^\$\s*/, "");
+      return /^(\d{1,3}(?:[.,]\d{3})+|\d+)$/.test(t) ? Number(t.replace(/[.,]/g, "")) : null;
+    }
   }
 
   // El descuento tiene que ser el % comercial del proveedor sobre la suma de

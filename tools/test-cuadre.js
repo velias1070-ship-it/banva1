@@ -235,8 +235,8 @@ console.log("descuento al pie — hallazgos de la revision");
   check("porcentaje con miles y espacio ('1.000 %') no es un monto", descuentoAlPieRespaldado("Descuento 1.000 %", 1000) === false);
   check("'Descuento $29.600' misma linea", descuentoAlPieRespaldado("Descuento $29.600", 29600) === true);
   check("'Descuento 29.600,00' con decimales", descuentoAlPieRespaldado("Descuento 29.600,00", 29600) === true);
-  check("monto a 3 lineas del 'Descuento' ya no respalda",
-    descuentoAlPieRespaldado("Descuento\na\nb\n29,600", 29600) === false);
+  check("monto a 3 lineas del 'Descuento', con texto+numero entre medio, no respalda",
+    descuentoAlPieRespaldado("Descuento\na 12 x\nb\n29,600", 29600) === false);
 }
 {
   // Hallazgo 2/3: el % del proveedor. Suma a lista 296.000, 10 %.
@@ -281,6 +281,24 @@ console.log("descuento al pie — hallazgos de la revision");
   check("encabezado de columna: la ventana lo respalda (límite conocido)", respaldado === true);
   check("encabezado de columna: el cuadre solo lo taparía", d === 5000, "d=" + d);
   check("encabezado de columna: el % del proveedor lo frena", !(respaldado && d > 0 && descuentoCalzaConPct(suma, d, 10, 3)));
+}
+
+// Rotulos en columna (forma real de la 266247, montos sinteticos): Vision
+// lista los rotulos del pie y despues los montos.
+{
+  const ocr = ["P.Unit Total Desc.", "1,000", "Valor Total", "50,000", "Descuento",
+    "Monto Neto", "IVA (19%)", "Total", "5,000", "45,000", "8,550", "53,550",
+    "PERSONA QUE RECIBE"].join("\n");
+  check("columna: el descuento es el monto en la posicion de «Descuento»", descuentoAlPieRespaldado(ocr, 5000) === true);
+  check("columna: el neto (posicion de «Monto Neto») no pasa por descuento", descuentoAlPieRespaldado(ocr, 45000) === false);
+  check("columna: el IVA no pasa", descuentoAlPieRespaldado(ocr, 8550) === false);
+  check("columna: el total no pasa", descuentoAlPieRespaldado(ocr, 53550) === false);
+  check("columna: el valor total de la linea (antes del rotulo) no pasa", descuentoAlPieRespaldado(ocr, 50000) === false);
+  const conSub = ["Subtotal", "Descuento", "Monto Neto", "50,000", "5,000", "45,000"].join("\n");
+  check("columna: con un rotulo antes, toma la 2a posicion", descuentoAlPieRespaldado(conSub, 5000) === true);
+  check("columna: con un rotulo antes, el subtotal no pasa", descuentoAlPieRespaldado(conSub, 50000) === false);
+  const cortado = ["Descuento", "Monto Neto", "PERSONA QUE RECIBE", "Nombre:", "algo 12 texto", "5,000"].join("\n");
+  check("columna: una linea con texto y numero corta el bloque de montos", descuentoAlPieRespaldado(cortado, 5000) === false);
 }
 
 console.log(fallas === 0 ? "\nRESULTADO: todos los tests pasan" : "\nRESULTADO: " + fallas + " falla(s)");
