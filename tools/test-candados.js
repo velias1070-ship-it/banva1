@@ -527,6 +527,32 @@ console.log("CASO 15 — consenso discrepante bloquea hasta que el operador resu
 }
 
 // ------------------------------------------------------------
+// Factura de codigos numericos: ruido alfanumerico del encabezado (montos y
+// codigos sinteticos; el repo es publico).
+{
+  const cat = ["100000000001", "100000000002", "100000000003", "ABCDE12345"];
+  const ocr = "PROVEEDOR DEMO\nSucursal Centro WSWMA999. Tel:(45) 221 0700\n" +
+    "10.00 UNI 100000000001 PRODUCTO UNO 1,000 10,000\n" +
+    "10.00 UNI 100000000002 PRODUCTO DOS 1,000 10,000\n";
+  const prods = [
+    { sku: "100000000001", skuOriginal: "100000000001" },
+    { sku: "100000000002", skuOriginal: "100000000002" },
+  ];
+  const cod = (o, p, c) => Locks.checkCodigosFactura(o, p, c).map(b => b.codigo);
+  check("numerica: WSWMA999 (lejos del catalogo) no dispara",
+    cod(ocr, prods, cat).indexOf("WSWMA999") === -1);
+  check("numerica sin catalogo: falla cerrado, WSWMA999 dispara",
+    cod(ocr + " ", prods, []).indexOf("WSWMA999") !== -1);
+  check("numerica: un SKU alfanumerico del catalogo impreso sin linea SI dispara",
+    cod(ocr + "5.00 UNI ABCDE12345 PRODUCTO TRES 1,000 5,000\n", prods, cat).indexOf("ABCDE12345") !== -1);
+  check("numerica: un SKU alfanumerico cercano al catalogo (≤2) SI dispara",
+    cod(ocr + "5.00 UNI ABCDE12399 PRODUCTO TRES 1,000 5,000\n", prods, cat).indexOf("ABCDE12399") !== -1);
+  const prodsAlfa = prods.concat([{ sku: "ABCDE12345", skuOriginal: "ABCDE12345" }]);
+  check("factura con UN SKU alfanumerico: la excepcion no aplica, WSWMA999 dispara",
+    cod(ocr + "5.00 UNI ABCDE12345 PRODUCTO TRES 1,000 5,000\n", prodsAlfa, cat).indexOf("WSWMA999") !== -1);
+}
+
+// ------------------------------------------------------------
 console.log("");
 if (fallas > 0) { console.log("RESULTADO: " + fallas + " test(s) FALLARON"); process.exit(1); }
 console.log("RESULTADO: todos los tests pasan");
