@@ -611,57 +611,69 @@ function generateLabelsPDF(products, folioFactura) {
           console.error("Barcode error:", e);
         }
         
+        // Product name: 1 line, or 2 if it doesn't fit (cut at the last space
+        // before 48 chars; a too-long second line ends in "..."). The number of
+        // lines decides where everything else goes.
+        let l1 = nombre;
+        let l2 = "";
+        if (nombre.length > 48) {
+          const mid = nombre.lastIndexOf(" ", 48);
+          l1 = nombre.substring(0, mid > 0 ? mid : 48);
+          const resto = nombre.substring(mid > 0 ? mid + 1 : 48);
+          l2 = resto.length > 48 ? resto.substring(0, 48) + "..." : resto;
+        }
+        const dosLineas = l2.length > 0;
+
+        // Layout in mm (Vicente, 24-oct-2026), the same as banvabodega
+        // (src/constants/etiquetas.constants.ts, DIBUJO_ETIQUETA_PRODUCTO): the
+        // barcode is 50x14 mm (was 52x12 at 1.5 mm from the top) with 5 mm of
+        // white on each side, because the printer shifts the label 2-3 mm and
+        // with 4 mm the reader hesitated; the SKU is 4.2 mm (was 5) and the
+        // whole block is tighter and centered in the label's height. Positions
+        // are from the top of the barcode; `fin` is the foot of the last text.
+        const pos = dosLineas
+          ? { codigo: 17.5, sep1: 18.8, nombre1: 21.6, nombre2: 24.2, sep2: 25.8, universal: 29.1, fin: 29.7 }
+          : { codigo: 17.5, sep1: 18.8, nombre1: 21.8, nombre2: null, sep2: 23.4, universal: 26.7, fin: 27.3 };
+        const top = (40 - pos.fin) / 2;
+
         // Draw barcode centered on label
-        const bcTargetW = 52 * MM;
-        const bcTargetH = 12 * MM;
+        const bcTargetW = 50 * MM;
+        const bcTargetH = 14 * MM;
         const bcX = (LABEL_W - bcTargetW) / 2;
-        const bcY = 1.5 * MM;
+        const bcY = top * MM;
         ctx.imageSmoothingEnabled = false;
         ctx.drawImage(bcCanvas, bcX, bcY, bcTargetW, bcTargetH);
         ctx.imageSmoothingEnabled = true;
-        
+
         // Código ML big below barcode
         ctx.fillStyle = "#000000";
-        ctx.font = `bold ${5 * MM}px Arial, Helvetica, sans-serif`;
+        ctx.font = `bold ${4.2 * MM}px Arial, Helvetica, sans-serif`;
         ctx.textAlign = "center";
-        ctx.fillText(product.codigoML, LABEL_W / 2, 17.5 * MM);
-        
+        ctx.fillText(product.codigoML, LABEL_W / 2, (top + pos.codigo) * MM);
+
         // Separator line
         ctx.strokeStyle = "#CCCCCC";
         ctx.lineWidth = 0.3 * MM;
         ctx.beginPath();
-        ctx.moveTo(4 * MM, 19.5 * MM);
-        ctx.lineTo(LABEL_W - 4 * MM, 19.5 * MM);
+        ctx.moveTo(4 * MM, (top + pos.sep1) * MM);
+        ctx.lineTo(LABEL_W - 4 * MM, (top + pos.sep1) * MM);
         ctx.stroke();
-        
+
         // Product name
         ctx.font = `${2.3 * MM}px Arial, Helvetica, sans-serif`;
         ctx.fillStyle = "#000000";
-        let labelName = nombre;
-        if (labelName.length > 48) {
-          const mid = labelName.lastIndexOf(" ", 48);
-          const l1 = labelName.substring(0, mid > 0 ? mid : 48);
-          const l2 = labelName.substring(mid > 0 ? mid + 1 : 48);
-          if (l2.length > 48) {
-            ctx.fillText(l1, LABEL_W / 2, 22.5 * MM);
-            ctx.fillText(l2.substring(0, 48) + "...", LABEL_W / 2, 25.5 * MM);
-          } else {
-            ctx.fillText(l1, LABEL_W / 2, 22.5 * MM);
-            ctx.fillText(l2, LABEL_W / 2, 25.5 * MM);
-          }
-        } else {
-          ctx.fillText(labelName, LABEL_W / 2, 23.5 * MM);
-        }
-        
+        ctx.fillText(l1, LABEL_W / 2, (top + pos.nombre1) * MM);
+        if (dosLineas) ctx.fillText(l2, LABEL_W / 2, (top + pos.nombre2) * MM);
+
         // Separator line before SKU
         ctx.beginPath();
-        ctx.moveTo(4 * MM, 28.5 * MM);
-        ctx.lineTo(LABEL_W - 4 * MM, 28.5 * MM);
+        ctx.moveTo(4 * MM, (top + pos.sep2) * MM);
+        ctx.lineTo(LABEL_W - 4 * MM, (top + pos.sep2) * MM);
         ctx.stroke();
-        
+
         // Cod. Universal: SKU at bottom
         ctx.font = `bold ${2.8 * MM}px Arial, Helvetica, sans-serif`;
-        ctx.fillText(`Cod. Universal: ${product.skuVenta || product.sku || ""}`, LABEL_W / 2, 32.5 * MM);
+        ctx.fillText(`Cod. Universal: ${product.skuVenta || product.sku || ""}`, LABEL_W / 2, (top + pos.universal) * MM);
         
         // Folio tiny at bottom-right
         if (folioFactura) {
