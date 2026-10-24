@@ -626,18 +626,21 @@ function generateLabelsPDF(products, folioFactura) {
 
         // Layout in mm (Vicente, 24-oct-2026), the same as banvabodega
         // (src/constants/etiquetas.constants.ts, DIBUJO_ETIQUETA_PRODUCTO): the
-        // barcode is 50x14 mm (was 52x12 at 1.5 mm from the top) with 5 mm of
-        // white on each side, because the printer shifts the label 2-3 mm and
-        // with 4 mm the reader hesitated; the SKU is 4.2 mm (was 5) and the
-        // whole block is tighter and centered in the label's height. Positions
-        // are from the top of the barcode; `fin` is the foot of the last text.
+        // barcode is 48x14 mm (was 52x12 at 1.5 mm from the top) with 6 mm of
+        // white on each side. The printer shifts the print 3.1-3.3 mm (measured
+        // on 4 photos of 23-oct) and the readers want ~5 modules of white: the
+        // 9-character ML code keeps 5.1 modules with a 4 mm shift at 48 mm
+        // (at 50 mm it didn't read with 3.5 mm). The SKU is 4.2 mm (was 5) and
+        // the whole block is tighter and centered in the label's height.
+        // Positions are from the top of the barcode; `fin` is the foot of the
+        // last text.
         const pos = dosLineas
           ? { codigo: 17.5, sep1: 18.8, nombre1: 21.6, nombre2: 24.2, sep2: 25.8, universal: 29.1, fin: 29.7 }
           : { codigo: 17.5, sep1: 18.8, nombre1: 21.8, nombre2: null, sep2: 23.4, universal: 26.7, fin: 27.3 };
         const top = (40 - pos.fin) / 2;
 
         // Draw barcode centered on label
-        const bcTargetW = 50 * MM;
+        const bcTargetW = 48 * MM;
         const bcTargetH = 14 * MM;
         const bcX = (LABEL_W - bcTargetW) / 2;
         const bcY = top * MM;
